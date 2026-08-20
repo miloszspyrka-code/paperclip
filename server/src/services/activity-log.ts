@@ -90,6 +90,17 @@ function readNonEmptyString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+async function resolveActivityRunId(db: Db, companyId: string, runId: string | null | undefined) {
+  const normalizedRunId = readNonEmptyString(runId);
+  if (!normalizedRunId || !isUuidLike(normalizedRunId)) return null;
+  const run = await db
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, normalizedRunId)))
+    .then((rows) => rows[0] ?? null);
+  return run?.id ?? null;
+}
+
 export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActivityInput) {
   if (input.responsibleUserIdOverride !== undefined) {
     return readNonEmptyString(input.responsibleUserIdOverride);
@@ -159,7 +170,9 @@ export function publishActivity(publication: ActivityPublication) {
 
 export async function persistActivity(db: Db, input: LogActivityInput) {
   const redactedDetails = await redactActivityDetails(db, input.details ?? null);
-  const responsibleUserId = await resolveResponsibleUserIdForActivity(db, input);
+  // An absent/deleted run must not violate activity_log.run_id's FK after a write succeeds.
+  const runId = await resolveActivityRunId(db, input.companyId, input.runId);
+  const responsibleUserId = await resolveResponsibleUserIdForActivity(db, { ...input, runId });
   const [activity] = await db.insert(activityLog).values({
     companyId: input.companyId,
     actorType: input.actorType,
@@ -168,7 +181,7 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
     entityType: input.entityType,
     entityId: input.entityId,
     agentId: input.agentId ?? null,
-    runId: input.runId ?? null,
+    runId,
     responsibleUserId,
     details: redactedDetails,
   }).returning({ id: activityLog.id });
@@ -180,7 +193,7 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
     entityType: input.entityType,
     entityId: input.entityId,
     agentId: input.agentId ?? null,
-    runId: input.runId ?? null,
+    runId,
     responsibleUserId,
     details: redactedDetails,
   };
@@ -198,7 +211,7 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
         payload: {
           ...redactedDetails,
           agentId: input.agentId ?? null,
-          runId: input.runId ?? null,
+          runId,
           responsibleUserId,
         },
       }

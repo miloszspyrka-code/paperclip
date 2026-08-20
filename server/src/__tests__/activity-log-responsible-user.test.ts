@@ -243,4 +243,87 @@ describeEmbeddedPostgres("logActivity responsible-user stamping", () => {
 
     expect(row?.responsibleUserId).toBe("key-user");
   });
+
+  it("preserves a valid heartbeat run id on the activity audit", async () => {
+    const auditCompanyId = randomUUID();
+    const auditAgentId = randomUUID();
+    const auditRunId = randomUUID();
+    await db.insert(companies).values({
+      id: auditCompanyId,
+      name: "Paperclip",
+      issuePrefix: `T${auditCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: auditAgentId,
+      companyId: auditCompanyId,
+      name: "AuditAgent",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: auditRunId,
+      companyId: auditCompanyId,
+      agentId: auditAgentId,
+      status: "running",
+    });
+
+    await logActivity(db, activityInput({
+      companyId: auditCompanyId,
+      actorId: auditAgentId,
+      agentId: auditAgentId,
+      entityId: auditAgentId,
+      entityType: "agent",
+      runId: auditRunId,
+    }));
+
+    const row = await db
+      .select({ runId: activityLog.runId })
+      .from(activityLog)
+      .where(eq(activityLog.companyId, auditCompanyId))
+      .then((rows) => rows[0]);
+    expect(row?.runId).toBe(auditRunId);
+  });
+
+  it("drops a missing heartbeat run id instead of failing the audit write", async () => {
+    const auditCompanyId = randomUUID();
+    const auditAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: auditCompanyId,
+      name: "Paperclip",
+      issuePrefix: `T${auditCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: auditAgentId,
+      companyId: auditCompanyId,
+      name: "AuditAgent",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await expect(logActivity(db, activityInput({
+      companyId: auditCompanyId,
+      actorId: auditAgentId,
+      agentId: auditAgentId,
+      entityId: auditAgentId,
+      entityType: "agent",
+      runId: randomUUID(),
+    }))).resolves.toBeDefined();
+
+    const row = await db
+      .select({ runId: activityLog.runId })
+      .from(activityLog)
+      .where(eq(activityLog.companyId, auditCompanyId))
+      .then((rows) => rows[0]);
+    expect(row?.runId).toBeNull();
+  });
 });
