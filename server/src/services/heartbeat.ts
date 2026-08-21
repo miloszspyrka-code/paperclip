@@ -3415,6 +3415,36 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   return servers;
 }
 
+/**
+ * Stable, token-free identity of the MCP Connections delivered to a run.
+ * This is used before token minting so session reuse changes only when the
+ * effective Paperclip access set changes, never because a run token rotated.
+ */
+export async function buildPaperclipRuntimeMcpIdentity(input: {
+  db: Db;
+  agent: Pick<typeof agents.$inferSelect, "id" | "companyId">;
+}): Promise<Array<{ connectionId: string; name: string }>> {
+  const effective = await toolAccessService(input.db).getEffectiveProfilesForAgent(
+    input.agent.companyId,
+    input.agent.id,
+  );
+  const permittedConnectionIds = new Set([
+    ...effective.entries
+      .filter((entry) => entry.effect === "include" && entry.connectionId)
+      .map((entry) => entry.connectionId!),
+    ...effective.allowedTools.map((tool) => tool.connectionId),
+  ]);
+  return effective.installedConnections
+    .filter((connection) =>
+      permittedConnectionIds.has(connection.id)
+      && connection.status === "active"
+      && connection.enabled
+      && connection.transport === "mcp_remote",
+    )
+    .map((connection) => ({ connectionId: connection.id, name: connection.name }))
+    .sort((a, b) => a.connectionId.localeCompare(b.connectionId));
+}
+
 function createAdapterRuntimeMcpAccess(
   servers: AdapterRuntimeMcpServer[],
 ): AdapterRuntimeMcpAccess | undefined {
@@ -14576,9 +14606,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         versionPinsEnabled: resolvedInstanceSettings.experimental.enableBetaSkills === true,
       }),
     });
+    const runtimeMcpIdentity = await buildPaperclipRuntimeMcpIdentity({
+      db,
+      agent: { id: agent.id, companyId: agent.companyId },
+    });
     let runtimeConfig: Record<string, unknown> = {
       ...effectiveResolvedConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
+      paperclipRuntimeMcp: runtimeMcpIdentity,
     };
     const latestAgentConfigRevision = await getLatestAgentConfigRevision(agent.companyId, agent.id);
     const sessionConfigMetadata = await buildEffectiveRunSessionConfigMetadata({

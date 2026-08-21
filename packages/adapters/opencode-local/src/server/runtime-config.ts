@@ -1,23 +1,26 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
 
 export const NOT_EXPOSED = "NOT_EXPOSED" as const;
 export type NotExposedMarker = typeof NOT_EXPOSED;
 
-export type OpenCodeRuntimeMcpSource =
-  | "paperclip_core"
-  | "managed_connection"
-  | "inherited_user_mcp";
+export const PAPERCLIP_OPERATOR_COMMAND_NAMES = [
+  "paperclip-debug-run",
+  "paperclip-napraw-tools",
+  "paperclip-opencode-health",
+  "paperclip-deleguj-coo",
+  "paperclip-wdroz-runtime",
+] as const;
+
+export type OpenCodeRuntimeMcpSource = "managed_connection";
 
 export type OpenCodeRuntimeToolSource =
   | "builtin"
-  | "paperclip_core"
-  | "managed_connection"
-  | "inherited_user_mcp"
-  | "inherited_plugin";
+  | "managed_connection";
 
 export type OpenCodeRuntimeMcpServer = {
   name: string;
@@ -40,6 +43,7 @@ export type OpenCodeRuntimeDiagnostics = {
     serializedToolSchemaChars: number | NotExposedMarker;
   };
   plugins: {
+    allowlistedPluginCount: number;
     inheritedPluginCount: number;
   };
   notes: string[];
@@ -50,6 +54,14 @@ export type PreparedOpenCodeRuntimeConfig = {
   notes: string[];
   cleanup: () => Promise<void>;
   diagnostics: OpenCodeRuntimeDiagnostics;
+  paths: {
+    runtimeRoot: string;
+    configHome: string;
+    dataHome: string;
+    cacheHome: string;
+    stateHome: string;
+    authFile: string;
+  };
 };
 
 export type PrepareOpenCodeRuntimeConfigInput = {
@@ -57,67 +69,34 @@ export type PrepareOpenCodeRuntimeConfigInput = {
   config: Record<string, unknown>;
   targetIsRemote?: boolean;
   runtimeMcpServers?: AdapterRuntimeMcpServer[];
-  paperclipCoreMcp?: { name: string; url: string; token: string } | null;
+  runtimeSkills?: Array<{ runtimeName: string; source: string }>;
+  hostAuthFile?: string;
   diagnosticsSink?: (diagnostics: OpenCodeRuntimeDiagnostics) => void;
 };
 
-const PAPERCLIP_CORE_MCP_NAME = "paperclip";
-const DEFAULT_INHERIT_FLAGS = {
-  inheritUserOpenCodeConfig: false,
-  inheritUserMcp: false,
-  inheritUserPlugins: false,
-};
-
-// Top-level OpenCode config keys that are user-level extension / UI surfaces and
-// must never leak into a managed, headless Paperclip run unless explicitly opted
-// in. The curated runtime config is built from scratch; these are the keys we
-// refuse to carry over from the operator's global OpenCode config.
-const USER_SURFACE_KEYS = new Set([
-  "mcp",
-  "plugin",
-  "plugins",
-  "pluginDirectory",
-  "pluginDirectories",
-  "command",
-  "commands",
-  "agent",
-  "agents",
-  "theme",
-  "tui",
-]);
-
-function resolveXdgConfigHome(env: Record<string, string>): string {
-  return (
-    (typeof env.XDG_CONFIG_HOME === "string" && env.XDG_CONFIG_HOME.trim()) ||
-    (typeof process.env.XDG_CONFIG_HOME === "string" && process.env.XDG_CONFIG_HOME.trim()) ||
-    path.join(os.homedir(), ".config")
-  );
-}
+const RUNTIME_ROOT_ENV = "PAPERCLIP_OPENCODE_RUNTIME_ROOT";
+const PAPERCLIP_RUNTIME_PLUGIN_KEY = "opencodeRuntimePlugins";
+const DEFAULT_STALE_RUNTIME_MS = 24 * 60 * 60 * 1000;
+const PAPERCLIP_COMMAND_ROOT_RELATIVE_CANDIDATES = [
+  "../../../../../.opencode/commands",
+  "../../../../.opencode/commands",
+];
+const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function resolveInheritFlags(config: Record<string, unknown>) {
-  return {
-    inheritUserOpenCodeConfig: asBoolean(
-      config.inheritUserOpenCodeConfig,
-      DEFAULT_INHERIT_FLAGS.inheritUserOpenCodeConfig,
-    ),
-    inheritUserMcp: asBoolean(config.inheritUserMcp, DEFAULT_INHERIT_FLAGS.inheritUserMcp),
-    inheritUserPlugins: asBoolean(
-      config.inheritUserPlugins,
-      DEFAULT_INHERIT_FLAGS.inheritUserPlugins,
-    ),
-  };
+function safePathSegment(value: string | undefined, fallback: string): string {
+  const normalized = (value ?? "").trim().replace(/[^a-zA-Z0-9_-]/g, "_");
+  return normalized || fallback;
 }
 
-// Recursively replace {env:VAR} placeholders with the resolved value. Used to bake
-// gateway provider secrets (e.g. the LLM-gateway virtual key) into opencode.json
-// SERVER-SIDE, where the value is reliably present. OpenCode's own {env:...}
-// resolution happens inside the (possibly sandboxed) run process, whose env
-// plumbing is not guaranteed to carry the key to OpenCode's spawned server -- so
-// we resolve it here. Unresolvable placeholders are left intact for OpenCode to try.
+function resolveHostDataHome(): string {
+  const configured = process.env.XDG_DATA_HOME?.trim();
+  return configured || path.join(os.homedir(), ".local", "share");
+}
+
 function expandEnvPlaceholders<T>(value: T, resolve: (name: string) => string | undefined): T {
   if (typeof value === "string") {
     return value.replace(/\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, (match, name: string) => {
@@ -148,19 +127,13 @@ function parseProviderConfig(
   try {
     parsed = JSON.parse(raw);
   } catch {
-    // Surface the misconfiguration instead of silently dropping the provider
-    // block; an unparseable value would otherwise be undiagnosable.
     notes.push("PAPERCLIP_OPENCODE_PROVIDERS contains invalid JSON; custom providers ignored.");
     return null;
   }
   if (!isPlainObject(parsed)) {
-    notes.push(
-      "PAPERCLIP_OPENCODE_PROVIDERS is set but is not a JSON object; custom providers ignored.",
-    );
+    notes.push("PAPERCLIP_OPENCODE_PROVIDERS is set but is not a JSON object; custom providers ignored.");
     return null;
   }
-  // Only keep provider entries that are themselves objects; surface the ones
-  // we drop so a malformed entry is just as diagnosable as malformed JSON.
   const providers: Record<string, unknown> = {};
   const skipped: string[] = [];
   for (const [key, value] of Object.entries(parsed)) {
@@ -168,9 +141,7 @@ function parseProviderConfig(
     else skipped.push(key);
   }
   if (skipped.length > 0) {
-    notes.push(
-      `PAPERCLIP_OPENCODE_PROVIDERS: skipped provider(s) with non-object values: ${skipped.join(", ")}.`,
-    );
+    notes.push(`PAPERCLIP_OPENCODE_PROVIDERS: skipped provider(s) with non-object values: ${skipped.join(", ")}.`);
   }
   return Object.keys(providers).length > 0 ? providers : null;
 }
@@ -183,110 +154,58 @@ function parseConfiguredModelRef(raw: unknown): { provider: string; model: strin
   return { provider: trimmed.slice(0, slash), model: trimmed.slice(slash + 1) };
 }
 
-async function readJsonObject(filepath: string): Promise<Record<string, unknown>> {
-  try {
-    const raw = await fs.readFile(filepath, "utf8");
-    const parsed = JSON.parse(raw);
-    return isPlainObject(parsed) ? parsed : {};
-  } catch {
-    return {};
+function parsePluginAllowlist(config: Record<string, unknown>, runtimeRoot: string, notes: string[]): string[] {
+  const raw = config[PAPERCLIP_RUNTIME_PLUGIN_KEY];
+  if (raw === undefined) return [];
+  const entries = Array.isArray(raw)
+    ? raw
+    : typeof raw === "string"
+      ? raw.split(",")
+      : null;
+  if (!entries) {
+    notes.push(`${PAPERCLIP_RUNTIME_PLUGIN_KEY} must be an array of pinned plugin specs; no plugins enabled.`);
+    return [];
   }
-}
-
-function stripTopLevelPaperclipMcpEntry(raw: string): string {
-  let output = raw;
-  let offset = 0;
-  while (offset < output.length) {
-    const keyIdx = findKeyAtTopLevel(output, "paperclip", offset);
-    if (keyIdx === -1) break;
-    const braceStart = output.indexOf("{", keyIdx);
-    if (braceStart === -1) break;
-    let depth = 0;
-    let inString = false;
-    let end = -1;
-    for (let i = braceStart; i < output.length; i++) {
-      const ch = output[i];
-      if (ch === '"' && output[i - 1] !== "\\") inString = !inString;
-      if (inString) continue;
-      if (ch === "{") depth += 1;
-      else if (ch === "}") {
-        depth -= 1;
-        if (depth === 0) {
-          end = i;
-          break;
-        }
-      }
+  const plugins: string[] = [];
+  for (const entry of entries) {
+    if (typeof entry !== "string" || entry.trim().length === 0) continue;
+    const spec = entry.trim();
+    if (path.isAbsolute(spec) && !path.resolve(spec).startsWith(path.resolve(runtimeRoot) + path.sep)) {
+      notes.push(`Skipped plugin path outside Paperclip runtime root: ${path.basename(spec)}.`);
+      continue;
     }
-    if (end === -1) break;
-    let removalEnd = end + 1;
-    while (removalEnd < output.length && (output[removalEnd] === " " || output[removalEnd] === "\t" || output[removalEnd] === "\r" || output[removalEnd] === "\n")) {
-      removalEnd += 1;
-    }
-    if (output[removalEnd] === ",") removalEnd += 1;
-    output = `${output.slice(0, keyIdx)}${output.slice(removalEnd)}`;
-    offset = keyIdx;
+    if (!plugins.includes(spec)) plugins.push(spec);
   }
-  return output;
+  return plugins;
 }
 
-function findKeyAtTopLevel(text: string, key: string, from: number): number {
-  const needle = `"${key}"`;
-  let idx = text.indexOf(needle, from);
-  while (idx !== -1) {
-    const before = text.slice(0, idx);
-    const inString = (before.match(/"/g) ?? []).length % 2 === 1;
-    const inLineComment = before.lastIndexOf("//") > before.lastIndexOf("\n");
-    if (!inString && !inLineComment) {
-      const after = text.slice(idx + needle.length).trimStart();
-      if (after.startsWith(":")) return idx;
+function parseCommandFrontmatter(markdown: string): { description: string; template: string } | null {
+  const normalized = markdown.replace(/\r\n/g, "\n");
+  const match = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/m.exec(normalized);
+  if (!match) return null;
+  const descriptionLine = match[1]
+    .split("\n")
+    .map((line) => /^description\s*:\s*(.*)$/.exec(line)?.[1]?.trim() ?? "")
+    .find(Boolean);
+  const description = descriptionLine?.replace(/^(["'])(.*)\1$/, "$2").trim() ?? "";
+  const template = (match[2] ?? "").trim();
+  if (!description || !template) return null;
+  return { description, template };
+}
+
+async function loadPaperclipOperatorCommands(): Promise<Record<string, { description: string; template: string }>> {
+  for (const relativeRoot of PAPERCLIP_COMMAND_ROOT_RELATIVE_CANDIDATES) {
+    const root = path.resolve(__moduleDir, relativeRoot);
+    const commands: Record<string, { description: string; template: string }> = {};
+    for (const name of PAPERCLIP_OPERATOR_COMMAND_NAMES) {
+      const source = await fs.readFile(path.join(root, `${name}.md`), "utf8").catch(() => null);
+      if (!source) continue;
+      const parsed = parseCommandFrontmatter(source);
+      if (parsed) commands[name] = parsed;
     }
-    idx = text.indexOf(needle, idx + needle.length);
+    if (Object.keys(commands).length > 0) return commands;
   }
-  return -1;
-}
-
-function buildPaperclipMcpEntry(input: {
-  env: Record<string, string>;
-}): Record<string, unknown> | null {
-  if (input.env.PAPERCLIP_OPENCODE_PAPERCLIP_MCP === "0") return null;
-  const stdioCmd = process.env.MCP_STDIO_CMD?.trim();
-  const stdioArgsRaw = process.env.MCP_STDIO_ARGS?.trim();
-  if (!stdioCmd || !stdioArgsRaw) return null;
-  const apiKey = input.env.PAPERCLIP_API_KEY?.trim();
-  if (!apiKey) return null;
-  const apiUrl =
-    input.env.PAPERCLIP_API_URL?.trim() ??
-    process.env.PAPERCLIP_API_URL?.trim() ??
-    "http://127.0.0.1:3100";
-  const environment: Record<string, string> = {
-    PAPERCLIP_API_URL: apiUrl,
-    PAPERCLIP_API_KEY: apiKey,
-    PAPERCLIP_COMPANY_ID: input.env.PAPERCLIP_COMPANY_ID ?? "",
-    PAPERCLIP_AGENT_ID: input.env.PAPERCLIP_AGENT_ID ?? "",
-    PAPERCLIP_RUN_ID: input.env.PAPERCLIP_RUN_ID ?? "",
-  };
-  return {
-    type: "local",
-    command: [stdioCmd, ...stdioArgsRaw.split(/\s+/).filter(Boolean)],
-    environment,
-    enabled: true,
-  };
-}
-
-// Read only the `paperclip` core MCP entry from the operator's global OpenCode
-// config. We deliberately do NOT copy or inherit the rest of the global config;
-// the core Paperclip MCP is the single user-level surface we must preserve so the
-// managed agent can still reach the Paperclip control plane.
-function extractCorePaperclipMcp(
-  existingConfig: Record<string, unknown>,
-): Record<string, unknown> | null {
-  const mcp = isPlainObject(existingConfig.mcp) ? existingConfig.mcp : {};
-  const direct = mcp[PAPERCLIP_CORE_MCP_NAME];
-  if (isPlainObject(direct)) return direct;
-  const servers = isPlainObject(mcp.servers) ? mcp.servers : {};
-  const paperclipEntry = servers[PAPERCLIP_CORE_MCP_NAME];
-  if (!isPlainObject(paperclipEntry)) return null;
-  return paperclipEntry;
+  return {};
 }
 
 function materializeManagedMcpServer(server: AdapterRuntimeMcpServer): Record<string, unknown> {
@@ -298,53 +217,58 @@ function materializeManagedMcpServer(server: AdapterRuntimeMcpServer): Record<st
   };
 }
 
-function materializeCorePaperclipMcp(input: {
-  name: string;
-  url: string;
-  token: string;
-}): Record<string, unknown> {
-  return {
-    type: "remote",
-    url: input.url,
-    enabled: true,
-    headers: { Authorization: `Bearer ${input.token}` },
-  };
+function pluginPackageName(spec: string): string | null {
+  const at = spec.startsWith("@") ? spec.indexOf("@", spec.indexOf("/") + 1) : spec.lastIndexOf("@");
+  if (at <= 0) return null;
+  return spec.slice(0, at);
 }
 
-function sanitizeUrlForDiagnostics(url: string): string {
-  try {
-    const parsed = new URL(url);
-    if (parsed.searchParams.size > 0) {
-      parsed.search = "";
-      return `${parsed.toString()}?<redacted>`;
+async function seedAllowlistedPlugins(
+  plugins: string[],
+  runtimeRoot: string,
+): Promise<Map<string, string>> {
+  const hostCacheRoot = process.env.XDG_CACHE_HOME?.trim() || path.join(os.homedir(), ".cache");
+  const hostPackagesRoot = path.join(hostCacheRoot, "opencode", "packages");
+  const runtimePluginRoot = path.join(runtimeRoot, "plugins");
+  const resolved = new Map<string, string>();
+  for (const spec of plugins) {
+    if (!/^(?:@[^/\s]+\/[^@/\s]+|[^@/\s]+)@[^\s]+$/.test(spec)) continue;
+    const packageName = pluginPackageName(spec);
+    if (!packageName) continue;
+    const source = path.join(hostPackagesRoot, spec);
+    const destination = path.join(runtimePluginRoot, spec.replace(/[\\/]/g, "_"));
+    const sourcePackage = path.join(source, "node_modules", packageName);
+    const destinationPackage = path.join(destination, "node_modules", packageName);
+    const [sourceStat, destinationStat] = await Promise.all([
+      fs.stat(sourcePackage).catch(() => null),
+      fs.stat(destinationPackage).catch(() => null),
+    ]);
+    if (!sourceStat?.isDirectory()) continue;
+    if (!destinationStat) {
+      await fs.mkdir(path.dirname(destinationPackage), { recursive: true });
+      await fs.cp(sourcePackage, destinationPackage, { recursive: true, errorOnExist: false });
     }
-    return parsed.toString();
-  } catch {
-    return "<unparseable-url>";
-  }
-}
-
-// Strip user-level extension / UI surfaces from an inherited global config.
-// `mcp` is handled separately (only the core Paperclip server is re-added), so it
-// is always stripped here. Plugins/commands/agents/theme/tui are stripped unless
-// the matching explicit opt-in flag is set.
-function stripUnsafeUserSurfaces(
-  existing: Record<string, unknown>,
-  flags: { inheritUserMcp: boolean; inheritUserPlugins: boolean },
-): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(existing)) {
-    if (USER_SURFACE_KEYS.has(key)) {
-      if (key === "plugin" || key === "plugins" || key === "pluginDirectory" || key === "pluginDirectories") {
-        if (!flags.inheritUserPlugins) continue;
-        out[key] = value;
-        continue;
-      }
-      continue;
+    const packageJsonRaw = await fs.readFile(path.join(destinationPackage, "package.json"), "utf8").catch(() => null);
+    if (!packageJsonRaw) continue;
+    try {
+      const packageJson = JSON.parse(packageJsonRaw) as {
+        exports?: string | { "."?: string | { import?: string; default?: string } };
+        main?: string;
+      };
+      const exported = typeof packageJson.exports === "string"
+        ? packageJson.exports
+        : typeof packageJson.exports?.["."] === "string"
+          ? packageJson.exports["."]
+          : typeof packageJson.exports?.["."] === "object"
+            ? packageJson.exports["."]?.import ?? packageJson.exports["."]?.default
+            : null;
+      const entryPath = path.resolve(destinationPackage, exported ?? packageJson.main ?? "src/index.ts");
+      if (entryPath.startsWith(path.resolve(destinationPackage) + path.sep)) resolved.set(spec, entryPath);
+    } catch {
+      // Keep the pinned npm spec when package metadata is malformed.
     }
-    out[key] = value;
   }
-  return out;
+  return resolved;
 }
 
 function emptyDiagnostics(notes: string[]): OpenCodeRuntimeDiagnostics {
@@ -361,253 +285,192 @@ function emptyDiagnostics(notes: string[]): OpenCodeRuntimeDiagnostics {
       duplicateToolNames: NOT_EXPOSED,
       serializedToolSchemaChars: NOT_EXPOSED,
     },
-    plugins: { inheritedPluginCount: 0 },
+    plugins: { allowlistedPluginCount: 0, inheritedPluginCount: 0 },
     notes,
   };
+}
+
+async function sweepStaleRuntimeDirectories(runtimeRoot: string): Promise<void> {
+  const tmpRoot = path.join(runtimeRoot, "tmp");
+  const entries = await fs.readdir(tmpRoot, { withFileTypes: true }).catch(() => []);
+  const cutoff = Date.now() - DEFAULT_STALE_RUNTIME_MS;
+  await Promise.all(entries.filter((entry) => entry.isDirectory()).map(async (entry) => {
+    const candidate = path.join(tmpRoot, entry.name);
+    const marker = path.join(candidate, ".paperclip-active");
+    const [stat, markerStat] = await Promise.all([
+      fs.stat(candidate).catch(() => null),
+      fs.stat(marker).catch(() => null),
+    ]);
+    const age = Math.max(stat?.mtimeMs ?? 0, markerStat?.mtimeMs ?? 0);
+    if (age > 0 && age < cutoff) await fs.rm(candidate, { recursive: true, force: true });
+  }));
+}
+
+async function copyProviderAuth(input: {
+  provider: string | null;
+  sourceFile: string;
+  destinationFile: string;
+  notes: string[];
+}): Promise<void> {
+  if (!input.provider) return;
+  const raw = await fs.readFile(input.sourceFile, "utf8").catch(() => null);
+  if (!raw) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    input.notes.push("Host OpenCode auth.json is invalid; provider auth bridge skipped.");
+    return;
+  }
+  if (!isPlainObject(parsed) || !isPlainObject(parsed[input.provider])) return;
+  await fs.mkdir(path.dirname(input.destinationFile), { recursive: true });
+  await fs.writeFile(
+    input.destinationFile,
+    `${JSON.stringify({ [input.provider]: parsed[input.provider] }, null, 2)}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
+  await fs.chmod(input.destinationFile, 0o600).catch(() => undefined);
+  input.notes.push(`Copied only the configured provider auth record for ${input.provider} into the Paperclip agent data root.`);
 }
 
 export async function prepareOpenCodeRuntimeConfig(
   input: PrepareOpenCodeRuntimeConfigInput,
 ): Promise<PreparedOpenCodeRuntimeConfig> {
-  const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
-  if (!skipPermissions) {
-    const notes = [
-      "dangerouslySkipPermissions=false: skipping managed runtime OpenCode config isolation.",
-    ];
-    return {
-      env: input.env,
-      notes,
-      cleanup: async () => {},
-      diagnostics: emptyDiagnostics(notes),
-    };
-  }
-
-  const flags = resolveInheritFlags(input.config);
   const notes: string[] = [];
-  const diagnostics: OpenCodeRuntimeDiagnostics = emptyDiagnostics(notes);
-
-  const runtimeConfigHome = await fs.mkdtemp(
-    path.join(os.tmpdir(), "paperclip-opencode-config-"),
+  const diagnostics = emptyDiagnostics(notes);
+  const configuredRoot = input.env[RUNTIME_ROOT_ENV]?.trim();
+  const runtimeRoot = path.resolve(
+    configuredRoot || await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-runtime-")),
   );
-  const runtimeConfigDir = path.join(runtimeConfigHome, "opencode");
-  const runtimeConfigPath = path.join(runtimeConfigDir, "opencode.json");
-  await fs.mkdir(runtimeConfigDir, { recursive: true });
+  const ownsRuntimeRoot = !configuredRoot;
+  const agentId = safePathSegment(input.env.PAPERCLIP_AGENT_ID, "unknown-agent");
+  const runId = safePathSegment(input.env.PAPERCLIP_RUN_ID, `run-${Date.now()}`);
+  const configHome = path.join(runtimeRoot, "tmp", runId, "config");
+  const dataHome = path.join(runtimeRoot, "agents", agentId, "data");
+  const cacheHome = path.join(runtimeRoot, "cache");
+  const stateHome = path.join(dataHome, "state");
+  const authFile = path.join(dataHome, "opencode", "auth.json");
+  const activeMarker = path.join(runtimeRoot, "tmp", runId, ".paperclip-active");
 
-  // We no longer recursively copy the operator's global OpenCode config. The
-  // managed, headless run gets a curated config built below. We only READ the
-  // global config (local runs) to extract the single core Paperclip MCP the
-  // agent needs to reach the control plane.
-  const sourceConfigDir = path.join(resolveXdgConfigHome(input.env), "opencode");
-  // Read the operator's global OpenCode config. We read it so we can (a) preserve
-  // the single core Paperclip MCP and (b) optionally inherit benign top-level
-  // keys when explicitly opted in. We never copy the directory, and we never set
-  // XDG_CONFIG_HOME to the host path (the curated config lives in a fresh tmpdir,
-  // which is what gets shipped to remote targets).
-  const existingConfig = await readJsonObject(
-    path.join(sourceConfigDir, "opencode.json"),
-  );
+  await fs.mkdir(path.dirname(activeMarker), { recursive: true });
+  await Promise.all([
+    fs.mkdir(path.join(configHome, "opencode"), { recursive: true }),
+    fs.mkdir(dataHome, { recursive: true }),
+    fs.mkdir(cacheHome, { recursive: true }),
+    fs.mkdir(stateHome, { recursive: true }),
+    fs.mkdir(path.join(runtimeRoot, "plugins"), { recursive: true }),
+    fs.writeFile(activeMarker, `${process.pid}\n`, "utf8"),
+  ]);
+  const skillsRoot = path.join(configHome, "opencode", "skills");
+  for (const skill of input.runtimeSkills ?? []) {
+    const runtimeName = safePathSegment(skill.runtimeName, "skill");
+    if (!skill.source || runtimeName !== skill.runtimeName) continue;
+    const destination = path.join(skillsRoot, runtimeName);
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    await fs.cp(skill.source, destination, { recursive: true, force: true, dereference: true }).catch(() => undefined);
+  }
+  await sweepStaleRuntimeDirectories(runtimeRoot);
 
-  const inheritedBase = flags.inheritUserOpenCodeConfig
-    ? stripUnsafeUserSurfaces(existingConfig, {
-        inheritUserMcp: flags.inheritUserMcp,
-        inheritUserPlugins: flags.inheritUserPlugins,
-      })
-    : {};
-
-  // --- Curated permission: only what headless execution requires. ---
-  const existingPermission = isPlainObject(inheritedBase.permission)
-    ? inheritedBase.permission
-    : {};
-  notes.push(
-    "Injected runtime OpenCode config with permission.external_directory=allow to avoid headless approval prompts.",
-  );
-
-  // --- Provider / model wiring (unchanged, kept minimal). ---
+  const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
+  const configuredModel = parseConfiguredModelRef(input.config.model);
   const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
   const gatewayProviders = parseProviderConfig(
     input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? process.env.PAPERCLIP_OPENCODE_PROVIDERS,
     resolveEnv,
     notes,
   );
-  const existingProvider = isPlainObject(inheritedBase.provider)
-    ? (inheritedBase.provider as Record<string, unknown>)
-    : {};
-  let nextProvider = gatewayProviders
-    ? { ...existingProvider, ...gatewayProviders }
-    : existingProvider;
-  if (gatewayProviders) {
-    notes.push(
-      `Injected ${Object.keys(gatewayProviders).length} custom OpenCode provider(s) from PAPERCLIP_OPENCODE_PROVIDERS: ${Object.keys(gatewayProviders).join(", ")}.`,
-    );
-  }
-
-  const configuredModel = parseConfiguredModelRef(input.config.model);
+  let provider = gatewayProviders ?? {};
   if (configuredModel) {
-    const providerEntry = isPlainObject(nextProvider[configuredModel.provider])
-      ? { ...(nextProvider[configuredModel.provider] as Record<string, unknown>) }
+    const providerEntry = isPlainObject(provider[configuredModel.provider])
+      ? { ...(provider[configuredModel.provider] as Record<string, unknown>) }
       : {};
-    const providerModels = isPlainObject(providerEntry.models)
+    const models = isPlainObject(providerEntry.models)
       ? { ...(providerEntry.models as Record<string, unknown>) }
       : {};
-    if (!isPlainObject(providerModels[configuredModel.model])) {
-      providerModels[configuredModel.model] = {};
-      providerEntry.models = providerModels;
-      nextProvider = { ...nextProvider, [configuredModel.provider]: providerEntry };
-      notes.push(
-        `Registered configured model ${configuredModel.provider}/${configuredModel.model} in the runtime OpenCode config.`,
-      );
+    if (!isPlainObject(models[configuredModel.model])) {
+      models[configuredModel.model] = {};
+      providerEntry.models = models;
+      provider = { ...provider, [configuredModel.provider]: providerEntry };
     }
   }
 
+  const mcpServers: Record<string, Record<string, unknown>> = {};
+  for (const server of input.runtimeMcpServers ?? []) {
+    if (!server.name.trim()) continue;
+    mcpServers[server.name] = materializeManagedMcpServer(server);
+  }
+  diagnostics.mcp.managedConnectionCount = Object.keys(mcpServers).length;
+  diagnostics.mcp.serverNames = Object.keys(mcpServers).map((name) => ({
+    name,
+    source: "managed_connection",
+  }));
+  const plugins = parsePluginAllowlist(input.config, runtimeRoot, notes);
+  diagnostics.plugins.allowlistedPluginCount = plugins.length;
+  diagnostics.plugins.inheritedPluginCount = 0;
+  const localPluginEntries = await seedAllowlistedPlugins(plugins, runtimeRoot);
+  const operatorCommands = await loadPaperclipOperatorCommands();
+
+  const nextConfig: Record<string, unknown> = {
+    "$schema": "https://opencode.ai/config.json",
+    instructions: [],
+    permission: skipPermissions ? { external_directory: "allow" } : {},
+  };
+  if (Object.keys(provider).length > 0) nextConfig.provider = provider;
   const smallModel = (
     input.env.PAPERCLIP_OPENCODE_SMALL_MODEL ?? process.env.PAPERCLIP_OPENCODE_SMALL_MODEL
   )?.trim();
-  if (smallModel) {
-    notes.push(`Pinned OpenCode small_model to ${smallModel}.`);
-  }
-
-  // --- Curated MCP surfaces ---
-  const mcpServers: Record<string, { def: Record<string, unknown>; source: OpenCodeRuntimeMcpSource }> = {};
-
-  // 1. Core Paperclip MCP -- exactly one. Prefer an explicit run-scoped core
-  //    definition; otherwise extract the operator's global `paperclip` entry.
-  const corePaperclipMcp = input.paperclipCoreMcp
-    ? input.paperclipCoreMcp
-    : extractCorePaperclipMcp(existingConfig);
-  if (input.paperclipCoreMcp) {
-    mcpServers[PAPERCLIP_CORE_MCP_NAME] = {
-      def: materializeCorePaperclipMcp(input.paperclipCoreMcp),
-      source: "paperclip_core",
-    };
-    diagnostics.mcp.paperclipCoreCount = 1;
-    notes.push("Injected the run-scoped core Paperclip MCP server (exactly one).");
-  } else if (corePaperclipMcp) {
-    mcpServers[PAPERCLIP_CORE_MCP_NAME] = { def: corePaperclipMcp, source: "paperclip_core" };
-    diagnostics.mcp.paperclipCoreCount = 1;
-    notes.push(
-      "Preserved exactly one core Paperclip MCP server extracted from the operator config (no bulk inheritance).",
-    );
-  } else {
-    notes.push(
-      "No core Paperclip MCP was available to inject into the managed runtime config.",
-    );
-  }
-
-  // 2. Managed Connection gateways from the effective Paperclip Connection
-  //    profile. These are scoped to the agent's allowed tools.
-  const runtimeMcpServers = input.runtimeMcpServers ?? [];
-  for (const server of runtimeMcpServers) {
-    if (server.name === PAPERCLIP_CORE_MCP_NAME) continue;
-    mcpServers[server.name] = {
-      def: materializeManagedMcpServer(server),
-      source: "managed_connection",
-    };
-  }
-  diagnostics.mcp.managedConnectionCount = runtimeMcpServers.filter(
-    (s) => s.name !== PAPERCLIP_CORE_MCP_NAME,
-  ).length;
-
-  // 3. Inherited user MCP servers (opt-in only). The `paperclip` name is reserved
-  //    for the core server, so any user server colliding with it is skipped to
-  //    avoid a duplicate core MCP.
-  let inheritedUserMcpCount = 0;
-  if (flags.inheritUserMcp) {
-    const userMcp = isPlainObject(existingConfig.mcp) ? existingConfig.mcp : {};
-    const flatServers: Record<string, unknown> = {};
-    for (const [name, def] of Object.entries(userMcp)) {
-      if (name === "servers") continue;
-      if (isPlainObject(def) && typeof (def as Record<string, unknown>).type === "string") flatServers[name] = def;
-    }
-    const legacyServers = isPlainObject(userMcp.servers) ? (userMcp.servers as Record<string, unknown>) : {};
-    const userServers = { ...flatServers, ...legacyServers };
-    for (const [name, def] of Object.entries(userServers)) {
-      if (name === PAPERCLIP_CORE_MCP_NAME) continue;
-      if (!isPlainObject(def)) continue;
-      if (mcpServers[name]) continue;
-      mcpServers[name] = { def, source: "inherited_user_mcp" };
-      inheritedUserMcpCount += 1;
-    }
-  }
-  diagnostics.mcp.inheritedUserMcpCount = inheritedUserMcpCount;
-
-  diagnostics.mcp.serverNames = Object.entries(mcpServers).map(([name, value]) => ({
-    name,
-    source: value.source,
-  }));
-
-  if (!mcpServers[PAPERCLIP_CORE_MCP_NAME]) {
-    const stdioEntry = buildPaperclipMcpEntry({ env: input.env });
-    if (stdioEntry) {
-      mcpServers[PAPERCLIP_CORE_MCP_NAME] = { def: stdioEntry, source: "paperclip_core" };
-      diagnostics.mcp.paperclipCoreCount = 1;
-      diagnostics.mcp.serverNames = Object.entries(mcpServers).map(([name, v]) => ({ name, source: v.source }));
-      notes.push("Injected per-run Paperclip MCP (stdio) with run-scoped identity.");
-    }
-  }
-
-  // --- Curated plugins (opt-in only) ---
-  const inheritedPluginCount = flags.inheritUserPlugins
-    ? countPluginEntries(inheritedBase)
-    : 0;
-  diagnostics.plugins.inheritedPluginCount = inheritedPluginCount;
-
-  // --- Assemble the curated config ---
-  const nextConfig: Record<string, unknown> = {
-    ...inheritedBase,
-    permission: {
-      ...existingPermission,
-      external_directory: "allow",
-    },
-  };
-  if (Object.keys(nextProvider).length > 0) {
-    nextConfig.provider = nextProvider;
-  }
-  if (smallModel) {
-    nextConfig.small_model = smallModel;
-  }
-  if (Object.keys(mcpServers).length > 0) {
-    nextConfig.mcp = Object.fromEntries(
-      Object.entries(mcpServers).map(([name, value]) => [name, value.def]),
-    );
-  }
-  if (inheritedPluginCount > 0) {
-    const plugins = inheritedBase.plugin ?? inheritedBase.plugins;
-    if (plugins !== undefined) nextConfig.plugin = plugins;
-    if (inheritedBase.plugins !== undefined) nextConfig.plugins = inheritedBase.plugins;
-  }
-
-  notes.push(
-    `Curated managed OpenCode runtime config: mcp servers=${diagnostics.mcp.serverNames.length} (core=${diagnostics.mcp.paperclipCoreCount}, managed=${diagnostics.mcp.managedConnectionCount}, inherited=${diagnostics.mcp.inheritedUserMcpCount}), inherited plugins=${inheritedPluginCount}.`,
-  );
-
+  if (smallModel) nextConfig.small_model = smallModel;
+  if (Object.keys(mcpServers).length > 0) nextConfig.mcp = mcpServers;
+  if (plugins.length > 0) nextConfig.plugin = plugins.map((plugin) => localPluginEntries.get(plugin) ?? plugin);
+  if (Object.keys(operatorCommands).length > 0) nextConfig.command = operatorCommands;
   await fs.writeFile(
-    runtimeConfigPath,
+    path.join(configHome, "opencode", "opencode.json"),
     `${JSON.stringify(nextConfig, null, 2)}\n`,
     "utf8",
   );
 
-  input.diagnosticsSink?.(diagnostics);
+  const hostAuthFile = input.hostAuthFile ?? path.join(resolveHostDataHome(), "opencode", "auth.json");
+  await copyProviderAuth({
+    provider: configuredModel?.provider ?? null,
+    sourceFile: hostAuthFile,
+    destinationFile: authFile,
+    notes,
+  });
+  notes.push("Built Paperclip OpenCode config from scratch; host MCP, plugins, commands, agents and skills were not read.");
+  notes.push("Injected only effective Paperclip Connection MCP gateways.");
+  if (Object.keys(operatorCommands).length > 0) {
+    notes.push(`Injected ${Object.keys(operatorCommands).length} Paperclip operator command wrappers.`);
+  } else {
+    notes.push("No Paperclip operator command wrappers were found.");
+  }
+  if (plugins.length === 0) notes.push("No Paperclip OpenCode plugins are enabled for this run.");
+
+  const runtimeEnv: Record<string, string> = {
+    ...input.env,
+    PAPERCLIP_OPENCODE_CONFIG_ROOT: configHome,
+    PAPERCLIP_OPENCODE_DATA_ROOT: dataHome,
+    PAPERCLIP_OPENCODE_CACHE_ROOT: cacheHome,
+    PAPERCLIP_OPENCODE_STORAGE_DIR: dataHome,
+    XDG_CONFIG_HOME: configHome,
+    XDG_DATA_HOME: dataHome,
+    XDG_CACHE_HOME: cacheHome,
+    XDG_STATE_HOME: stateHome,
+    OPENCODE_DISABLE_PROJECT_CONFIG: "true",
+    ...(input.targetIsRemote ? {} : {
+      OPENCODE_DISABLE_EXTERNAL_SKILLS: "1",
+      OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1",
+    }),
+  };
 
   return {
-    env: {
-      ...input.env,
-      XDG_CONFIG_HOME: runtimeConfigHome,
-    },
+    env: runtimeEnv,
     notes,
-    cleanup: async () => {
-      await fs.rm(runtimeConfigHome, { recursive: true, force: true });
-    },
     diagnostics,
+    paths: { runtimeRoot, configHome, dataHome, cacheHome, stateHome, authFile },
+    cleanup: async () => {
+      await fs.rm(activeMarker, { force: true }).catch(() => undefined);
+      await fs.rm(path.join(runtimeRoot, "tmp", runId), { recursive: true, force: true }).catch(() => undefined);
+      if (ownsRuntimeRoot) await fs.rm(runtimeRoot, { recursive: true, force: true }).catch(() => undefined);
+    },
   };
-}
-
-function countPluginEntries(base: Record<string, unknown>): number {
-  const plugin = base.plugin;
-  const plugins = base.plugins;
-  let count = 0;
-  if (Array.isArray(plugin)) count += plugin.length;
-  else if (typeof plugin === "string" && plugin.length > 0) count += 1;
-  if (Array.isArray(plugins)) count += plugins.length;
-  else if (typeof plugins === "string" && plugins.length > 0) count += 1;
-  return count;
 }

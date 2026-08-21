@@ -32,7 +32,6 @@ import {
   joinPromptSections,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
-  ensurePaperclipSkillSymlink,
   ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   renderTemplate,
@@ -52,7 +51,6 @@ import {
   parseOpenCodeModelsOutput,
   requireOpenCodeModelId,
 } from "./models.js";
-import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
@@ -162,48 +160,6 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   }
 }
 
-function claudeSkillsHome(): string {
-  return path.join(os.homedir(), ".claude", "skills");
-}
-
-async function ensureOpenCodeSkillsInjected(
-  onLog: AdapterExecutionContext["onLog"],
-  skillsEntries: Array<{ key: string; runtimeName: string; source: string }>,
-  desiredSkillNames?: string[],
-) {
-  const skillsHome = claudeSkillsHome();
-  await fs.mkdir(skillsHome, { recursive: true });
-  const desiredSet = new Set(desiredSkillNames ?? skillsEntries.map((entry) => entry.key));
-  const selectedEntries = skillsEntries.filter((entry) => desiredSet.has(entry.key));
-  const removedSkills = await removeMaintainerOnlySkillSymlinks(
-    skillsHome,
-    selectedEntries.map((entry) => entry.runtimeName),
-  );
-  for (const skillName of removedSkills) {
-    await onLog(
-      "stderr",
-      `[paperclip] Removed maintainer-only OpenCode skill "${skillName}" from ${skillsHome}\n`,
-    );
-  }
-  for (const entry of selectedEntries) {
-    const target = path.join(skillsHome, entry.runtimeName);
-
-    try {
-      const result = await ensurePaperclipSkillSymlink(entry.source, target);
-      if (result === "skipped") continue;
-      await onLog(
-        "stderr",
-        `[paperclip] ${result === "repaired" ? "Repaired" : "Injected"} OpenCode skill "${entry.key}" into ${skillsHome}\n`,
-      );
-    } catch (err) {
-      await onLog(
-        "stderr",
-        `[paperclip] Failed to inject OpenCode skill "${entry.key}" into ${skillsHome}: ${err instanceof Error ? err.message : String(err)}\n`,
-      );
-    }
-  }
-}
-
 async function buildOpenCodeSkillsDir(config: Record<string, unknown>): Promise<string> {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-skills-"));
   const target = path.join(tmp, "skills");
@@ -253,14 +209,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
   const openCodeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredOpenCodeSkillNames = resolvePaperclipDesiredSkillNames(config, openCodeSkillEntries);
-  if (!executionTargetIsRemote) {
-    await ensureOpenCodeSkillsInjected(
-      onLog,
-      openCodeSkillEntries,
-      desiredOpenCodeSkillNames,
-    );
-  }
-
   const envConfig = parseObject(config.env);
   const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
   env.PAPERCLIP_RUN_ID = runId;
@@ -315,13 +263,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // selection is already handled via the --model CLI flag.  Set after the
   // envConfig loop so user overrides cannot disable this guard.
   env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
+  if (process.env.PAPERCLIP_OPENCODE_RUNTIME_ROOT && !env.PAPERCLIP_OPENCODE_RUNTIME_ROOT) {
+    env.PAPERCLIP_OPENCODE_RUNTIME_ROOT = process.env.PAPERCLIP_OPENCODE_RUNTIME_ROOT;
+  }
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
   const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
     env,
     config,
+    targetIsRemote: executionTargetIsRemote,
     runtimeMcpServers: ctx.runtimeMcp?.getServers() ?? [],
+    runtimeSkills: openCodeSkillEntries
+      .filter((entry) => desiredOpenCodeSkillNames.includes(entry.key))
+      .map((entry) => ({ runtimeName: entry.runtimeName, source: entry.source })),
   });
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
@@ -711,6 +666,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: {
           stdout: sanitizeSecretText(attempt.proc.stdout),
           stderr: sanitizeSecretText(attempt.proc.stderr),
+          opencodeStorageDir: preparedRuntimeConfig.paths.dataHome,
         },
         summary: attempt.parsed.summary ? sanitizeSecretText(attempt.parsed.summary) : attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),

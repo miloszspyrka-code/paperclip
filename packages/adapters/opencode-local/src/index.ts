@@ -121,6 +121,7 @@ Core fields:
 - promptTemplate (string, optional): run prompt template
 - command (string, optional): defaults to "opencode"
 - extraArgs (string[], optional): additional CLI args
+- opencodeRuntimePlugins (string[], optional): pinned npm plugin specs loaded only in the Paperclip-owned runtime; defaults to empty
 - env (object, optional): KEY=VALUE environment variables
 
 Operational fields:
@@ -134,8 +135,10 @@ Notes:
 - Runs are executed with: opencode run --format json ...
 - Sessions are resumed with --session when stored session cwd matches current cwd.
 - The adapter sets OPENCODE_DISABLE_PROJECT_CONFIG=true to prevent OpenCode from \
-  writing an opencode.json config file into the project working directory. Model \
-  selection is passed via the --model CLI flag instead.
+   writing an opencode.json config file into the project working directory. Model \
+   selection is passed via the --model CLI flag instead.
+- Paperclip Connections are the only MCP source for this runtime. User-level MCP, \
+   plugins, commands, agents and skills are not inherited.
 - When \`dangerouslySkipPermissions\` is enabled, Paperclip injects a temporary \
   runtime config with \`permission.external_directory=allow\` so headless runs do \
   not stall on approval prompts.

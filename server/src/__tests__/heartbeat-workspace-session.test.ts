@@ -1988,6 +1988,8 @@ async function buildSessionConfigMetadata(
     effectiveAdapterConfig: {
       command: "codex",
       model: "gpt-5.4-mini",
+      opencodeRuntimePlugins: ["openslimedit@1.0.1"],
+      paperclipRuntimeMcp: [{ connectionId: "connection-1", name: "Sender" }],
       env: {
         OPENAI_API_KEY: "resolved-secret-value",
         PLAIN_FLAG: "plain-value",
@@ -2232,6 +2234,30 @@ describe("effective run session config freshness", () => {
               missingDetail: null,
             },
           ],
+        }),
+      },
+      {
+        name: "Paperclip OpenCode plugin allowlist",
+        category: "adapterConfig",
+        metadata: await buildSessionConfigMetadata({
+          effectiveAdapterConfig: {
+            command: "codex",
+            model: "gpt-5.4-mini",
+            opencodeRuntimePlugins: [],
+            paperclipRuntimeMcp: [{ connectionId: "connection-1", name: "Sender" }],
+          },
+        }),
+      },
+      {
+        name: "Paperclip MCP Connection identity",
+        category: "adapterConfig",
+        metadata: await buildSessionConfigMetadata({
+          effectiveAdapterConfig: {
+            command: "codex",
+            model: "gpt-5.4-mini",
+            opencodeRuntimePlugins: ["openslimedit@1.0.1"],
+            paperclipRuntimeMcp: [{ connectionId: "connection-2", name: "Cloudflare" }],
+          },
         }),
       },
     ];

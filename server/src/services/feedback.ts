@@ -565,6 +565,7 @@ async function buildClaudeTraceFiles(input: {
 
 async function buildOpenCodeTraceFiles(input: {
   sessionId: string | null;
+  storageDir?: string | null;
   stdoutText: string;
   state: ReturnType<typeof createFeedbackRedactionState>;
   notes: string[];
@@ -588,7 +589,7 @@ async function buildOpenCodeTraceFiles(input: {
   }
 
   const opencodeRoot = resolveHomeAwarePath(
-    process.env.PAPERCLIP_OPENCODE_STORAGE_DIR ?? "~/.local/share/opencode",
+    input.storageDir?.trim() || process.env.PAPERCLIP_OPENCODE_STORAGE_DIR || "~/.local/share/opencode",
   );
   const sessionRoot = path.join(opencodeRoot, "storage", "session");
   const diffRoot = path.join(opencodeRoot, "storage", "session_diff");
@@ -1603,8 +1604,12 @@ async function buildFeedbackTraceBundleFromRow(
         rawAdapterTrace = adapter.raw;
         normalizedAdapterTrace = adapter.normalized;
       } else if (run.adapterType === "opencode_local") {
+        const resultJson = run.resultJson && typeof run.resultJson === "object" && !Array.isArray(run.resultJson)
+          ? run.resultJson as Record<string, unknown>
+          : null;
         const adapter = await buildOpenCodeTraceFiles({
           sessionId: run.sessionIdAfter ?? run.sessionIdBefore,
+          storageDir: typeof resultJson?.opencodeStorageDir === "string" ? resultJson.opencodeStorageDir : null,
           stdoutText,
           state,
           notes,
