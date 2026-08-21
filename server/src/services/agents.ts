@@ -512,7 +512,8 @@ export function agentService(db: Db) {
     }
 
     const isExplicitErrorClear = existing.status === "error" && data.status === "idle";
-    if (isExplicitErrorClear && !Object.prototype.hasOwnProperty.call(data, "errorReason")) {
+    const isStaleErrorClear = existing.status === "idle" && existing.errorReason && data.status === "idle";
+    if ((isExplicitErrorClear || isStaleErrorClear) && !Object.prototype.hasOwnProperty.call(data, "errorReason")) {
       (data as Record<string, unknown>).errorReason = null;
     }
 
