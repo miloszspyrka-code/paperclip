@@ -4363,7 +4363,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       };
     }
     const method = input.galleryEntry ? connectionMethodFor(input.galleryEntry) : null;
-    if (!method?.ownershipModes.includes("dcr")) {
+    // Gallery apps decide DCR through their connection method ownership modes.
+    // Pasted BYO MCP links have no gallery entry, so the authorization server
+    // itself decides: when it advertises a registration endpoint, DCR is the
+    // intended bootstrap and must not be blocked on a missing client id.
+    const dcrAllowed = method
+      ? method.ownershipModes.includes("dcr")
+      : Boolean(input.endpoints.registrationUrl);
+    if (!dcrAllowed) {
       throw unprocessable(`OAuth client id is not configured for ${input.endpoints.provider}`);
     }
 

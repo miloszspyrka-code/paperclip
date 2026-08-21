@@ -4884,6 +4884,222 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(JSON.stringify(connection.config)).not.toContain("generic-access-token");
   });
 
+  it("registers a dynamic OAuth client for a pasted MCP link (no static client id) and starts authorization", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", "https://paperclip.kompaszbiorek.pl");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SENDER_EXAMPLE_TEST_CLIENT_ID", "");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SENDER_EXAMPLE_TEST_CLIENT_SECRET", "");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_ID", "");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET", "");
+    const company = await createCompany(db);
+    const app = createRouteApp(db);
+    const registrationBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      const href = String(url);
+      if (href === "https://mcp.sender.example.test/mcp") {
+        return {
+          ok: false,
+          status: 401,
+          headers: {
+            get: (name: string) => name.toLowerCase() === "www-authenticate"
+              ? "Bearer resource_metadata=\"https://mcp.sender.example.test/.well-known/oauth-protected-resource/mcp\""
+              : null,
+          },
+          text: async () => "",
+          json: async () => ({}),
+        } as Response;
+      }
+      if (href === "https://mcp.sender.example.test/.well-known/oauth-protected-resource/mcp") {
+        return mcpHttpResponse({
+          resource: "https://mcp.sender.example.test/mcp",
+          authorization_servers: ["https://auth.sender.example.test"],
+          scopes_supported: ["mcp:use"],
+          bearer_methods_supported: ["header"],
+        });
+      }
+      if (href === "https://auth.sender.example.test/.well-known/oauth-authorization-server") {
+        return mcpHttpResponse({
+          issuer: "https://auth.sender.example.test",
+          authorization_endpoint: "https://auth.sender.example.test/oauth/authorize",
+          token_endpoint: "https://auth.sender.example.test/oauth/token",
+          registration_endpoint: "https://auth.sender.example.test/oauth/register",
+          scopes_supported: ["mcp:use"],
+          response_types_supported: ["code"],
+          code_challenge_methods_supported: ["S256"],
+          token_endpoint_auth_methods_supported: ["none"],
+        });
+      }
+      if (href === "https://auth.sender.example.test/oauth/register") {
+        expect(init?.method).toBe("POST");
+        registrationBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return mcpHttpResponse({
+          client_id: "sender-dcr-client",
+          redirect_uris: ["https://paperclip.kompaszbiorek.pl/api/tools/oauth/callback"],
+          grant_types: ["authorization_code", "refresh_token"],
+          response_types: ["code"],
+          token_endpoint_auth_method: "none",
+        });
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    });
+
+    const res = await request(app)
+      .post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({ link: "https://mcp.sender.example.test/mcp", name: "Sender DCR link" });
+
+    expect(res.status).toBe(201);
+    expect(res.body.auth).toMatchObject({ kind: "oauth" });
+    const startUrl = new URL(res.body.auth.startUrl);
+    expect(`${startUrl.origin}${startUrl.pathname}`).toBe("https://auth.sender.example.test/oauth/authorize");
+    expect(startUrl.searchParams.get("response_type")).toBe("code");
+    expect(startUrl.searchParams.get("client_id")).toBe("sender-dcr-client");
+    expect(startUrl.searchParams.get("redirect_uri")).toBe("https://paperclip.kompaszbiorek.pl/api/tools/oauth/callback");
+    expect(startUrl.searchParams.get("scope")).toBe("mcp:use");
+    expect(startUrl.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(startUrl.searchParams.get("code_challenge")).toBeTruthy();
+    expect(startUrl.searchParams.get("state")).toBeTruthy();
+    expect(registrationBodies).toEqual([{
+      client_name: "Paperclip (paperclip.kompaszbiorek.pl)",
+      redirect_uris: ["https://paperclip.kompaszbiorek.pl/api/tools/oauth/callback"],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    }]);
+
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, res.body.connectionId));
+    expect(connection).toMatchObject({ ownership: "dcr" });
+    expect(connection.config).toMatchObject({
+      oauth: {
+        provider: "mcp_sender_example_test",
+        clientId: "sender-dcr-client",
+        clientRegistrationSource: "dcr",
+        clientRedirectUri: "https://paperclip.kompaszbiorek.pl/api/tools/oauth/callback",
+        registrationUrl: "https://auth.sender.example.test/oauth/register",
+        tokenUrl: "https://auth.sender.example.test/oauth/token",
+      },
+    });
+    expect(JSON.stringify(connection.config)).not.toContain("secret");
+
+    fetchMock.mockClear();
+    const service = toolAccessService(db);
+    const reused = await service.startOAuth(company.id, res.body.connectionId, {
+      redirectUri: "https://paperclip.kompaszbiorek.pl/api/tools/oauth/callback",
+      actor: { actorType: "user", actorId: "board" },
+    });
+    expect(new URL(reused.authorizationUrl).searchParams.get("client_id")).toBe("sender-dcr-client");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the existing client-id error when a pasted link's authorization server has no registration endpoint", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", "https://paperclip.kompaszbiorek.pl");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SENDER_EXAMPLE_TEST_CLIENT_ID", "");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SENDER_EXAMPLE_TEST_CLIENT_SECRET", "");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_ID", "");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET", "");
+    const company = await createCompany(db);
+    const app = createRouteApp(db);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const href = String(url);
+      if (href === "https://noreg.sender.example.test/mcp") {
+        return {
+          ok: false,
+          status: 401,
+          headers: {
+            get: (name: string) => name.toLowerCase() === "www-authenticate"
+              ? "Bearer resource_metadata=\"https://noreg.sender.example.test/.well-known/oauth-protected-resource/mcp\""
+              : null,
+          },
+          text: async () => "",
+          json: async () => ({}),
+        } as Response;
+      }
+      if (href === "https://noreg.sender.example.test/.well-known/oauth-protected-resource/mcp") {
+        return mcpHttpResponse({ authorization_servers: ["https://auth.noreg.sender.example.test"] });
+      }
+      if (href === "https://auth.noreg.sender.example.test/.well-known/oauth-authorization-server") {
+        return mcpHttpResponse({
+          authorization_endpoint: "https://auth.noreg.sender.example.test/oauth/authorize",
+          token_endpoint: "https://auth.noreg.sender.example.test/oauth/token",
+          code_challenge_methods_supported: ["S256"],
+        });
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    });
+
+    const res = await request(app)
+      .post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({ link: "https://noreg.sender.example.test/mcp", name: "No-registration link" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toBe("OAuth client id is not configured for noreg_sender_example_test");
+  });
+
+  it("surfaces a clear error when dynamic client registration fails for a pasted MCP link", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", "https://paperclip.kompaszbiorek.pl");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SENDER_EXAMPLE_TEST_CLIENT_ID", "");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SENDER_EXAMPLE_TEST_CLIENT_SECRET", "");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_ID", "");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET", "");
+    const company = await createCompany(db);
+    const app = createRouteApp(db);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const href = String(url);
+      if (href === "https://mcp.sender.example.test/mcp") {
+        return {
+          ok: false,
+          status: 401,
+          headers: {
+            get: (name: string) => name.toLowerCase() === "www-authenticate"
+              ? "Bearer resource_metadata=\"https://mcp.sender.example.test/.well-known/oauth-protected-resource/mcp\""
+              : null,
+          },
+          text: async () => "",
+          json: async () => ({}),
+        } as Response;
+      }
+      if (href === "https://mcp.sender.example.test/.well-known/oauth-protected-resource/mcp") {
+        return mcpHttpResponse({ authorization_servers: ["https://auth.sender.example.test"] });
+      }
+      if (href === "https://auth.sender.example.test/.well-known/oauth-authorization-server") {
+        return mcpHttpResponse({
+          authorization_endpoint: "https://auth.sender.example.test/oauth/authorize",
+          token_endpoint: "https://auth.sender.example.test/oauth/token",
+          registration_endpoint: "https://auth.sender.example.test/oauth/register",
+          code_challenge_methods_supported: ["S256"],
+          token_endpoint_auth_methods_supported: ["none"],
+        });
+      }
+      if (href === "https://auth.sender.example.test/oauth/register") {
+        return {
+          ok: false,
+          status: 500,
+          headers: { get: () => null },
+          text: async () => JSON.stringify({
+            error: "invalid_client_metadata",
+            error_description: "redirect_uris must be absolute HTTPS URIs",
+          }),
+          json: async () => ({
+            error: "invalid_client_metadata",
+            error_description: "redirect_uris must be absolute HTTPS URIs",
+          }),
+        } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    });
+
+    const res = await request(app)
+      .post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({ link: "https://mcp.sender.example.test/mcp", name: "Sender DCR failure" });
+
+    expect(res.status).toBe(502);
+    expect(res.body).toMatchObject({
+      error: "redirect_uris must be absolute HTTPS URIs",
+      details: expect.objectContaining({
+        code: "oauth_dynamic_client_registration_failed",
+        providerError: "invalid_client_metadata",
+      }),
+    });
+  });
+
   it("blocks Smoke Lab OAuth issuer URLs from the normal tool OAuth secret pipeline", async () => {
     const company = await createCompany(db);
     const service = toolAccessService(db);

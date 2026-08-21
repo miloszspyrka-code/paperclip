@@ -280,6 +280,15 @@ export interface ExecutionWorkspace {
   runtimeServices?: WorkspaceRuntimeService[];
   createdAt: Date;
   updatedAt: Date;
+  /** Canonical delivery record for code issues; git-derived fields are set by Paperclip at workspace finalize. */
+  resultCommitSha?: string | null;
+  resultBranch?: string | null;
+  pushedRemote?: string | null;
+  remoteRef?: string | null;
+  remoteVerifiedSha?: string | null;
+  mergedToBase?: boolean | null;
+  testsRun?: number | null;
+  testsPassed?: number | null;
 }
 
 export interface WorkspaceRuntimeService {

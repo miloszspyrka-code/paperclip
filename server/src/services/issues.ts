@@ -755,6 +755,13 @@ export type IssueDependencyReadiness = {
   unresolvedBlockerCount: number;
   /** Blockers whose status is `done` but whose execution workspace has not yet finalized. */
   pendingFinalizeBlockerIssueIds: string[];
+  /**
+   * Done blockers whose canonical delivery record is missing or unmerged
+   * (deliveryState `unmerged`/`unknown` on a git_worktree workspace). Their code
+   * is not verifiably integrated into the base branch, so dependents must not
+   * start on a base that lacks it.
+   */
+  upstreamDeliveryBlockerIssueIds: string[];
   allBlockersDone: boolean;
   isDependencyReady: boolean;
 };
@@ -989,6 +996,7 @@ function createIssueDependencyReadiness(issueId: string): IssueDependencyReadine
     unresolvedBlockerIssueIds: [],
     unresolvedBlockerCount: 0,
     pendingFinalizeBlockerIssueIds: [],
+    upstreamDeliveryBlockerIssueIds: [],
     allBlockersDone: true,
     isDependencyReady: true,
   };
@@ -1255,6 +1263,41 @@ async function listIssueDependencyReadinessMap(
     doneBlockerWorkspacePairs,
   );
 
+  // Canonical-delivery gate: a done blocker whose git_worktree workspace has a
+  // persisted deliveryState of `unmerged` (or no delivery record at all) has not
+  // verifiably integrated its code into the base branch. Dependents starting on
+  // that base would silently build on top of missing upstream commits, so they
+  // stay unresolved with reason `upstream_code_not_integrated` until the record
+  // shows merged_by_ancestry / merged_via_pr or the relationship is removed.
+  const doneBlockerWorkspaceIds = doneBlockerWorkspacePairs.map((pair) => pair.executionWorkspaceId);
+  let deliveryMissingBlockerWorkspaceIds = new Set<string>();
+  if (doneBlockerWorkspaceIds.length > 0) {
+    const deliveryRows = await dbOrTx
+      .select({
+        id: executionWorkspaces.id,
+        strategyType: executionWorkspaces.strategyType,
+        deliveryState: executionWorkspaces.deliveryState,
+      })
+      .from(executionWorkspaces)
+      .where(
+        and(
+          eq(executionWorkspaces.companyId, companyId),
+          inArray(executionWorkspaces.id, doneBlockerWorkspaceIds),
+        ),
+      );
+    const deliveryStateByWorkspace = new Map(
+      deliveryRows.map((row) => [row.id, { strategyType: row.strategyType, deliveryState: row.deliveryState }]),
+    );
+    deliveryMissingBlockerWorkspaceIds = new Set(
+      doneBlockerWorkspaceIds.filter((workspaceId) => {
+        const record = deliveryStateByWorkspace.get(workspaceId);
+        if (!record) return false;
+        if (record.strategyType !== "git_worktree") return false;
+        return record.deliveryState !== "merged_by_ancestry" && record.deliveryState !== "merged_via_pr";
+      }),
+    );
+  }
+
   for (const row of blockerRows) {
     const current = readinessMap.get(row.issueId) ?? createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
@@ -1278,6 +1321,18 @@ async function listIssueDependencyReadinessMap(
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
       current.unresolvedBlockerCount += 1;
       current.pendingFinalizeBlockerIssueIds.push(row.blockerIssueId);
+      current.allBlockersDone = false;
+      current.isDependencyReady = false;
+    } else if (
+      row.blockerExecutionWorkspaceId &&
+      deliveryMissingBlockerWorkspaceIds.has(row.blockerExecutionWorkspaceId)
+    ) {
+      // Upstream code is not verifiably integrated into the base branch. Keep the
+      // dependent blocked with an explicit code-delivery reason instead of
+      // letting it start on a stale base.
+      current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
+      current.unresolvedBlockerCount += 1;
+      current.upstreamDeliveryBlockerIssueIds.push(row.blockerIssueId);
       current.allBlockersDone = false;
       current.isDependencyReady = false;
     }

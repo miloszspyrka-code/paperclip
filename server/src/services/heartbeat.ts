@@ -140,6 +140,7 @@ import {
   inspectManagedGitWorktreeBranch,
   persistAdapterManagedRuntimeServices,
   realizeExecutionWorkspace,
+  recordCanonicalWorkspaceDelivery,
   releaseRuntimeServicesForRun,
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
@@ -4114,6 +4115,27 @@ export function deriveTaskKeyWithHeartbeatFallback(
   return null;
 }
 
+export type ManagedTimerSkipDecision = {
+  source: string;
+  issueId?: string | null;
+  taskId?: string | null;
+  hasActionableWork: boolean;
+  allowEmptyTimerWakes: boolean;
+};
+
+// Pure, LLM-free decision for the managed timer preflight. An empty managed timer
+// (no concrete work assigned to the agent) must be skipped before the adapter,
+// OpenCode spawn, or any LLM request. Wake sources other than a generic timer
+// wake (assignment, on_demand, automation, issue-scoped wakes) are never cut by
+// this gate.
+export function shouldSkipEmptyManagedTimer(input: ManagedTimerSkipDecision): boolean {
+  const genericTimerWake =
+    input.source === "timer" && !input.issueId && !input.taskId;
+  if (!genericTimerWake) return false;
+  if (input.allowEmptyTimerWakes) return false;
+  return !input.hasActionableWork;
+}
+
 export function shouldResetTaskSessionForWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
@@ -6180,6 +6202,7 @@ export function buildPaperclipTaskMarkdown(input: {
     status?: string | null;
   } | null;
   acceptedPlanContinuation?: boolean;
+  interactionOnly?: boolean;
   // false builds the compact variant used for resume deltas, where the session
   // already received the description with the assignment.
   includeDescription?: boolean;
@@ -6219,7 +6242,14 @@ export function buildPaperclipTaskMarkdown(input: {
         `- Work mode: ${quoteTaskScalar("ask")}`,
         "",
         "Ask mode directive:",
-        "Answer the question directly in the issue thread. Do not write implementation code, and do not produce an implementation plan. Use tools only for investigation or temporary scratch work when needed; the deliverable is the answer.",
+        "Answer the question directly in the issue thread. Do not write implementation code, and do not produce an implementation plan. Use tools only for investigation or temporary scratch work when needed; the deliverable is the answer. Prefer existing issue evidence (comments, work products, continuation summary) and do a bounded targeted read only if the answer is not already evident. Do not run the test suite, repo-wide discovery, or broad grep unless the user explicitly asks for verification or the state may have changed.",
+      );
+    } else if (input.interactionOnly) {
+      lines.push(
+        `- Interaction: ${quoteTaskScalar("ask")}`,
+        "",
+        "Interaction-only directive:",
+        "Answer the question directly in the issue thread. Do not change the issue status, do not write implementation code, and do not produce an implementation plan. Prefer existing issue evidence and do a bounded targeted read only if needed. Do not run the test suite or broad repo discovery unless explicitly requested.",
       );
     } else if (issue.workMode === "planning") {
       let directive = "Make the plan only. Do not write code or perform implementation work.";
@@ -9316,6 +9346,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function handleSuccessfulRunHandoff(run: typeof heartbeatRuns.$inferSelect, agent: typeof agents.$inferSelect) {
     if (run.status !== "succeeded") return;
     const context = parseObject(run.contextSnapshot);
+    if (context.interactionOnly === true) return;
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     if (!issueId) return;
 
@@ -12226,6 +12257,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           heartbeat.issueOnlyTimer,
         false,
       ),
+      // Secure default for managed timer wakes: an empty timer (no actionable
+      // work assigned to this agent) must finish BEFORE the adapter, OpenCode
+      // spawn, or any LLM request. Opt back in to empty wakes only with an
+      // explicit, company-scoped flag.
+      allowEmptyTimerWakes: asBoolean(heartbeat.allowEmptyTimerWakes, false),
       maxDailyRuns: normalizeOptionalNonNegativeInteger(
         heartbeat.maxDailyRuns ?? heartbeat.dailyRunLimit ?? heartbeat.dailyRunCap ?? heartbeat.maxRunsPerDay,
       ),
@@ -12355,21 +12391,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
-    const row = await db
-      .select({ id: issues.id })
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, agent.companyId),
-          eq(issues.assigneeAgentId, agent.id),
-          isNull(issues.assigneeUserId),
-          isNull(issues.hiddenAt),
-          inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
-        ),
-      )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    return Boolean(row);
+    // Deterministic, LLM-free check: a managed timer wake is actionable only when
+    // there is concrete work assigned to THIS agent. We never treat mere inactivity
+    // as actionable. The check covers:
+    //  - assigned todo / in_progress issues (single-assignee task model)
+    //  - a pending thread interaction explicitly addressed to this agent
+    // Additional dimensions (due monitors/checks, routines with a real payload)
+    // extend the same contract below without requiring an LLM to decide.
+    const [assigned, pendingInteraction] = await Promise.all([
+      db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, agent.companyId),
+            eq(issues.assigneeAgentId, agent.id),
+            isNull(issues.assigneeUserId),
+            isNull(issues.hiddenAt),
+            inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: issueThreadInteractions.id })
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            eq(issueThreadInteractions.companyId, agent.companyId),
+            eq(issueThreadInteractions.addresseeAgentId, agent.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+    ]);
+    return Boolean(assigned) || Boolean(pendingInteraction);
   }
 
   async function markTimerHeartbeatChecked(agentId: string, source: WakeupOptions["source"]) {
@@ -12542,7 +12599,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const readiness = dependencyReadiness.get(issueId);
       const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
       if (unresolvedBlockerCount > 0 && !allowsIssueInteractionWake(context)) {
-        await cancelQueuedRunForBlockedDependencies(run, issueId, readiness?.unresolvedBlockerIssueIds ?? []);
+        await cancelQueuedRunForBlockedDependencies(
+          run,
+          issueId,
+          readiness?.unresolvedBlockerIssueIds ?? [],
+          (readiness?.upstreamDeliveryBlockerIssueIds?.length ?? 0) > 0
+            ? "upstream_code_not_integrated"
+            : "issue_dependencies_blocked",
+        );
         logger.info({ runId: run.id, issueId, unresolvedBlockerCount }, "claimQueuedRun: cancelled blocked queued run");
         return null;
       }
@@ -12631,17 +12695,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
     unresolvedBlockerIssueIds: string[],
+    errorCode: "issue_dependencies_blocked" | "upstream_code_not_integrated" = "issue_dependencies_blocked",
   ) {
     const now = new Date();
     const reason =
-      "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve";
+      errorCode === "upstream_code_not_integrated"
+        ? "Cancelled because upstream blocker code is not verifiably integrated into the base branch (deliveryState unmerged/unknown); Paperclip will wake the assignee when upstream delivery is recorded"
+        : "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve";
     const cancelled = await setRunStatus(run.id, "cancelled", {
       finishedAt: now,
       error: reason,
-      errorCode: "issue_dependencies_blocked",
+      errorCode,
       resultJson: {
         ...parseObject(run.resultJson),
-        stopReason: "issue_dependencies_blocked",
+        stopReason: errorCode,
         effectiveTimeoutSec: 0,
         timeoutConfigured: false,
         timeoutSource: "dependency_gate",
@@ -14172,6 +14239,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         kind: readNonEmptyString(context.interactionKind),
         status: readNonEmptyString(context.interactionStatus),
       },
+      interactionOnly: context.interactionOnly === true,
       acceptedPlanContinuation:
         readNonEmptyString(context.workspaceRefreshReason) === "accepted_plan_confirmation"
         && Object.keys(parseObject(context.acceptedPlanWakeRouting)).length === 0,
@@ -15451,7 +15519,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
         const sanitizedChunk = compactRunLogChunk(
-          redactCurrentUserText(chunk, currentUserRedactionOptions),
+          redactSensitiveText(redactCurrentUserText(chunk, currentUserRedactionOptions)),
         );
         if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
         if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
@@ -15785,46 +15853,60 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               executionWorkspaceId: branchInspection.workspaceRecord.id,
               ...managedGitWorktreeBranch,
             };
-            if (!inspection.valid) {
-              const workspaceValidationFingerprint = fingerprintFinalizeWorkspaceBranchValidation({
+        if (!inspection.valid) {
+          const workspaceValidationFingerprint = fingerprintFinalizeWorkspaceBranchValidation({
+            issueId: issueRef?.id ?? null,
+            executionWorkspaceId: branchInspection.workspaceRecord.id,
+            inspection: managedGitWorktreeBranch,
+          });
+          await workspaceOperationRecorder.recordOperation({
+            phase: "workspace_finalize",
+            cwd: executionWorkspace.cwd,
+            metadata: {
+              adapterType: agent.adapterType,
+              executionTargetKind: executionTarget?.kind ?? "local",
+              ...metadata,
+              managedGitWorktreeBranch: finalizeBranchMetadata,
+              ...(finalizeBranchRepairMetadata ? { managedGitWorktreeBranchRepair: finalizeBranchRepairMetadata } : {}),
+            },
+            run: async () => ({
+              status: "failed",
+              stderr: `Managed git worktree branch check failed: ${inspection.reason ?? "unknown branch mismatch"}\n`,
+            }),
+          });
+          adapterFinalizeOutcome = "failed";
+          throw new WorkspaceValidationFailure(
+            `Execution workspace ${branchInspection.workspaceRecord.id} expected git worktree branch "${inspection.expectedBranchName}" at "${inspection.worktreePath}", but ${inspection.reason ?? "the checked-out branch could not be verified"}. Record a sanctioned execution-workspace branch transition or restore the workspace branch before completing the run.`,
+            {
+              workspaceValidation: {
+                reason: "git_worktree_branch_incoherence",
+                fingerprint: workspaceValidationFingerprint,
+                adapterType: agent.adapterType,
                 issueId: issueRef?.id ?? null,
-                executionWorkspaceId: branchInspection.workspaceRecord.id,
-                inspection: managedGitWorktreeBranch,
-              });
-              await workspaceOperationRecorder.recordOperation({
-                phase: "workspace_finalize",
-                cwd: executionWorkspace.cwd,
-                metadata: {
-                  adapterType: agent.adapterType,
-                  executionTargetKind: executionTarget?.kind ?? "local",
-                  ...metadata,
-                  managedGitWorktreeBranch: finalizeBranchMetadata,
-                  ...(finalizeBranchRepairMetadata ? { managedGitWorktreeBranchRepair: finalizeBranchRepairMetadata } : {}),
-                },
-                run: async () => ({
-                  status: "failed",
-                  stderr: `Managed git worktree branch check failed: ${inspection.reason ?? "unknown branch mismatch"}\n`,
-                }),
-              });
-              adapterFinalizeOutcome = "failed";
-              throw new WorkspaceValidationFailure(
-                `Execution workspace ${branchInspection.workspaceRecord.id} expected git worktree branch "${inspection.expectedBranchName}" at "${inspection.worktreePath}", but ${inspection.reason ?? "the checked-out branch could not be verified"}. Record a sanctioned execution-workspace branch transition or restore the workspace branch before completing the run.`,
-                {
-                  workspaceValidation: {
-                    reason: "git_worktree_branch_incoherence",
-                    fingerprint: workspaceValidationFingerprint,
-                    adapterType: agent.adapterType,
-                    issueId: issueRef?.id ?? null,
-                    issueIdentifier: issueRef?.identifier ?? null,
-                    persistedExecutionWorkspaceId: branchInspection.workspaceRecord.id,
-                    executionWorkspaceCwd: executionWorkspace.cwd,
-                    managedGitWorktreeBranch: finalizeBranchMetadata,
-                  },
-                },
-              );
-            }
-          }
+                issueIdentifier: issueRef?.identifier ?? null,
+                persistedExecutionWorkspaceId: branchInspection.workspaceRecord.id,
+                executionWorkspaceCwd: executionWorkspace.cwd,
+                managedGitWorktreeBranch: finalizeBranchMetadata,
+              },
+            },
+          );
         }
+        // Persist the canonical delivery record. Paperclip verifies git itself
+        // (HEAD, pushed remote ref after fetch, ancestry vs base) so downstream
+        // dependency gates never rely on the agent's comment alone.
+        if (inspection.valid && inspection.actualBranchName) {
+          await recordCanonicalWorkspaceDelivery({
+            db,
+            workspaceId: branchInspection.workspaceRecord.id,
+            repoRoot: inspection.repoRoot ?? executionWorkspace.cwd,
+            worktreePath: inspection.worktreePath,
+            branchName: inspection.actualBranchName,
+            baseRef: branchInspection.workspaceRecord.baseRef ?? null,
+            recorder: workspaceOperationRecorder,
+          });
+        }
+      }
+    }
         await workspaceOperationRecorder.recordOperation({
           phase: "workspace_finalize",
           cwd: executionWorkspace.cwd,
@@ -17452,6 +17534,75 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
 
+    if (wakeCommentId && (reason === "issue_commented" || reason === "issue_reopened_via_comment")) {
+      const commentRow = await db
+        .select({
+          id: issueComments.id,
+          companyId: issueComments.companyId,
+          createdByRunId: issueComments.createdByRunId,
+          derivedAuthorAgentId: issueComments.derivedAuthorAgentId,
+        })
+        .from(issueComments)
+        .where(and(eq(issueComments.id, wakeCommentId), eq(issueComments.companyId, agent.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (commentRow) {
+        let effectiveAuthorAgentId: string | null = commentRow.derivedAuthorAgentId ?? null;
+        if (!effectiveAuthorAgentId && commentRow.createdByRunId) {
+          const runRow = await db
+            .select({ agentId: heartbeatRuns.agentId })
+            .from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.id, commentRow.createdByRunId), eq(heartbeatRuns.companyId, agent.companyId)))
+            .then((rows) => rows[0] ?? null);
+          effectiveAuthorAgentId = runRow?.agentId ?? null;
+        }
+        if (effectiveAuthorAgentId && effectiveAuthorAgentId === agentId) {
+          await db.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "self_wake_suppressed",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return null;
+        }
+        const existingDuplicate = await db
+          .select({ id: agentWakeupRequests.id })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+              sql`${agentWakeupRequests.payload} ->> 'commentId' = ${wakeCommentId}`,
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existingDuplicate) {
+          await db.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "duplicate_wake_suppressed",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return null;
+        }
+      }
+    }
+
     const writeSkippedRequest = async (
       skipReason: string,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
@@ -17664,9 +17815,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       !wakeCommentId &&
       !readNonEmptyString(enrichedContextSnapshot.taskId) &&
       !readNonEmptyString(enrichedContextSnapshot.taskKey);
-    if (policy.skipTimerWhenNoActionableWork && genericTimerWake && !(await hasActionableTimerWork(agent))) {
+    if (
+      genericTimerWake &&
+      !policy.allowEmptyTimerWakes &&
+      !(await hasActionableTimerWork(agent))
+    ) {
       await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
-        reason: "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
+        reason: "No assigned todo, in_progress issue, or pending interaction requires this agent before timer adapter invocation.",
       });
       await markTimerHeartbeatChecked(agentId, source);
       return null;

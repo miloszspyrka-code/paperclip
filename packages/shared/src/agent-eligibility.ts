@@ -34,16 +34,24 @@ export interface AgentInvalidOrgChainAncestor {
 
 export type AgentOrgChainInvalidReason =
   | "healthy"
+  | "errored_ancestor"
   | "terminated_ancestor"
   | "missing_manager"
   | "cycle";
 
 export interface AgentOrgChainHealth {
-  status: "healthy" | "invalid_org_chain";
+  status: "healthy" | "degraded" | "invalid_org_chain";
   reason: AgentOrgChainInvalidReason;
   fullChain: AgentOrgChainEntry[];
   firstInvalidAncestor: AgentInvalidOrgChainAncestor | null;
   invalidAncestors: AgentInvalidOrgChainAncestor[];
+  /**
+   * Ancestors with lifecycle status `error` (e.g. a failed run left the agent
+   * errored). They do not block work (error agents remain invokable), but the
+   * escalation/recovery path runs through them, so the chain is reported as
+   * `degraded` instead of `healthy` and this list explains why.
+   */
+  errorAncestors: AgentInvalidOrgChainAncestor[];
   repairGuidance: string | null;
   /**
    * Paused ancestors of a non-paused agent. A paused manager does not make
@@ -130,6 +138,7 @@ export function getAgentOrgChainHealth(input: {
   const byId = new Map(input.agents.map((agent) => [agent.id, agent]));
   const fullChain: AgentOrgChainEntry[] = [chainEntry(input.agent, 0, "self")];
   const invalidAncestors: AgentInvalidOrgChainAncestor[] = [];
+  const errorAncestors: AgentInvalidOrgChainAncestor[] = [];
   const pausedAncestors: AgentInvalidOrgChainAncestor[] = [];
   const seen = new Set<string>([input.agent.id]);
 
@@ -181,6 +190,9 @@ export function getAgentOrgChainHealth(input: {
     if (parent.status === "terminated") {
       invalidAncestors.push(invalidAncestor(parent));
     }
+    if (parent.status === "error") {
+      errorAncestors.push(invalidAncestor(parent));
+    }
     if (parent.status === "paused") {
       pausedAncestors.push({ id: parent.id, name: parent.name, status: "paused" });
     }
@@ -190,6 +202,7 @@ export function getAgentOrgChainHealth(input: {
   }
 
   const firstInvalidAncestor = invalidAncestors[0] ?? null;
+  const firstErrorAncestor = errorAncestors[0] ?? null;
   // Only warn for agents that can themselves receive and run work: a paused,
   // terminated, or unknown-status agent's escalation path is moot until it is
   // invokable again. Allowlist on purpose — a denylist complement would treat
@@ -201,20 +214,30 @@ export function getAgentOrgChainHealth(input: {
       `Work assigned to a paused agent never runs; unpause ${firstPausedAncestor.name} or change who this agent reports to.`
     : null;
   return {
-    status: firstInvalidAncestor ? "invalid_org_chain" : "healthy",
+    status: firstInvalidAncestor
+      ? "invalid_org_chain"
+      : errorAncestors.length > 0
+        ? "degraded"
+        : "healthy",
     reason: firstInvalidAncestor
       ? firstInvalidAncestor.status === "missing"
         ? "missing_manager"
         : firstInvalidAncestor.status === "cycle"
           ? "cycle"
           : "terminated_ancestor"
-      : "healthy",
+      : errorAncestors.length > 0
+        ? "errored_ancestor"
+        : "healthy",
     fullChain,
     firstInvalidAncestor,
     invalidAncestors,
+    errorAncestors,
     repairGuidance: firstInvalidAncestor
       ? buildRepairGuidance(input.agent, firstInvalidAncestor)
-      : null,
+      : firstErrorAncestor
+        ? `${input.agent.name} reports through errored ancestor ${firstErrorAncestor.name}. ` +
+          `The chain still schedules work, but recovery/escalation may be degraded until the error is cleared (agent clear-error).`
+        : null,
     pausedAncestors,
     escalationWarning,
   };

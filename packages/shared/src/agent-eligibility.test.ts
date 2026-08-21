@@ -155,6 +155,36 @@ describe("agent work eligibility", () => {
     expect(eligibility.assignabilityReason).toBe("invalid_org_chain");
     expect(eligibility.invokabilityReason).toBe("invalid_org_chain");
   });
+  it("reports errored ancestors as degraded without blocking work", () => {
+    const target = agent({ id: "engineer-1", name: "Engineer", status: "idle", reportsTo: "cto-1" });
+    const erroredCto = agent({ id: "cto-1", name: "CTO", status: "error", reportsTo: "ceo-1" });
+    const erroredCeo = agent({ id: "ceo-1", name: "CEO", status: "error", reportsTo: null });
+    const agents = [target, erroredCto, erroredCeo];
+
+    const health = getAgentOrgChainHealth({ agent: target, agents });
+    expect(health.status).toBe("degraded");
+    expect(health.reason).toBe("errored_ancestor");
+    expect(health.errorAncestors).toEqual([
+      { id: "cto-1", name: "CTO", status: "error" },
+      { id: "ceo-1", name: "CEO", status: "error" },
+    ]);
+    expect(health.invalidAncestors).toEqual([]);
+    expect(health.repairGuidance).toContain("errored ancestor CTO");
+
+    const eligibility = getAgentWorkEligibility({ agent: target, agents });
+    expect(eligibility.assignable).toBe(true);
+    expect(eligibility.invokable).toBe(true);
+    expect(eligibility.assignabilityReason).toBe("eligible");
+    expect(eligibility.invokabilityReason).toBe("eligible");
+  });
+
+  it("prefers invalid_org_chain over degraded when both apply", () => {
+    const target = agent({ id: "qa-5", name: "QA 5", status: "active", reportsTo: "cto-5" });
+    const erroredTerminated = agent({ id: "cto-5", name: "CTO 5", status: "terminated", reportsTo: null });
+    const health = getAgentOrgChainHealth({ agent: target, agents: [target, erroredTerminated] });
+    expect(health.status).toBe("invalid_org_chain");
+    expect(health.reason).toBe("terminated_ancestor");
+  });
 });
 
 describe("paused escalation path warning", () => {

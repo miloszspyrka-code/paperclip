@@ -1,6 +1,8 @@
 import {
   type AnyPgColumn,
+  boolean,
   index,
+  integer,
   jsonb,
   pgTable,
   text,
@@ -38,6 +40,19 @@ export const executionWorkspaces = pgTable(
     cleanupEligibleAt: timestamp("cleanup_eligible_at", { withTimezone: true }),
     cleanupReason: text("cleanup_reason"),
     metadata: jsonb("metadata").$type<Record<string, unknown>>(),
+    // Canonical delivery record for code issues. Git-derived fields are written
+    // by Paperclip itself during workspace finalize (never from the agent's
+    // comment alone); tests_run/tests_passed are only written through an
+    // explicit delivery report and stay null until reported.
+    resultCommitSha: text("result_commit_sha"),
+    resultBranch: text("result_branch"),
+    pushedRemote: text("pushed_remote"),
+    remoteRef: text("remote_ref"),
+    remoteVerifiedSha: text("remote_verified_sha"),
+    mergedToBase: boolean("merged_to_base"),
+    deliveryState: text("delivery_state"),
+    testsRun: integer("tests_run"),
+    testsPassed: integer("tests_passed"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

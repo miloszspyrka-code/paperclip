@@ -219,6 +219,9 @@ function shouldOmitObjectKey(
   if (VOLATILE_CONFIG_KEYS.has(key)) return true;
   if (HOST_NOISE_KEYS.has(key)) return true;
   if (isTimestampNoiseKey(key)) return true;
+  if (/^(scratch|ephemeral)(Dir|Path|Root)?$/i.test(key)) return true;
+  if (/^scratch[A-Z]/i.test(key)) return true;
+  if (category === "session" && /RevisionAt$/i.test(key)) return true;
   if (category === "session" && SESSION_HOST_PATH_KEYS.has(key)) return true;
   if (category === "lease" && (key === "remoteCwd" || key === "workspaceRemoteDir")) return true;
   return false;

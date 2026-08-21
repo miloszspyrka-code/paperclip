@@ -318,7 +318,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
+    env,
+    config,
+    runtimeMcpServers: ctx.runtimeMcp?.getServers() ?? [],
+  });
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {
@@ -626,6 +630,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     };
 
+    function sanitizeSecretText(input: string): string {
+      if (!input) return input;
+      let out = input;
+      out = out.replace(/Authorization:\s*Bearer\s+[^\s"'`]+/gi, "Authorization: Bearer ***REDACTED***");
+      out = out.replace(/PAPERCLIP_API_KEY\s*=\s*[^\s"'`]+/g, "PAPERCLIP_API_KEY=***REDACTED***");
+      out = out.replace(/pcgw_[A-Za-z0-9_-]+/g, "***REDACTED***");
+      out = out.replace(/Bearer\s+[A-Za-z0-9._~+\/=-]{20,}/g, "Bearer ***REDACTED***");
+      out = out.replace(/ghp_[A-Za-z0-9]+/g, "***REDACTED***");
+      out = out.replace(/gho_[A-Za-z0-9]+/g, "***REDACTED***");
+      out = out.replace(/NPM_TOKEN\s*=\s*[^\s]+/gi, "NPM_TOKEN=***REDACTED***");
+      out = out.replace(/GH_TOKEN\s*=\s*[^\s]+/gi, "GH_TOKEN=***REDACTED***");
+      return out;
+    }
+
     const toResult = (
       attempt: {
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string };
@@ -676,7 +694,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: synthesizedExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
-        errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+        errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : sanitizeSecretText(fallbackErrorMessage),
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,
           outputTokens: attempt.parsed.usage.outputTokens,
@@ -691,10 +709,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         billingType: "unknown",
         costUsd: attempt.parsed.costUsd,
         resultJson: {
-          stdout: attempt.proc.stdout,
-          stderr: attempt.proc.stderr,
+          stdout: sanitizeSecretText(attempt.proc.stdout),
+          stderr: sanitizeSecretText(attempt.proc.stderr),
         },
-        summary: attempt.parsed.summary,
+        summary: attempt.parsed.summary ? sanitizeSecretText(attempt.parsed.summary) : attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
       };
     };

@@ -4275,6 +4275,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        const successfulRunCtx = parseObject(successfulRun.contextSnapshot);
+        if (successfulRunCtx.interactionOnly === true) {
+          result.skipped += 1;
+          continue;
+        }
         const queued = await enqueueStrandedIssueRecovery({
           issueId: issue.id,
           agentId,

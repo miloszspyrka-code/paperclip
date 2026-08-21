@@ -2533,6 +2533,108 @@ async function directoryExists(value: string) {
   return fs.stat(value).then((stats) => stats.isDirectory()).catch(() => false);
 }
 
+// Known encoding-corrupted variants of the canonical project root, observed on
+// this Windows instance (UTF-8 bytes decoded as cp1250, or replaced with U+FFFD,
+// or a mistyped project dir name). They were persisted into DB rows and git
+// worktree registrations by older path handling and split the checkout across
+// sibling directories on disk.
+const CANONICAL_PROJECT_ROOT = path.resolve("C:\\Kompas Zbiórek");
+const KNOWN_CORRUPT_PROJECT_ROOTS = [
+  "C:\\Kompas Zbi\uFFFDrek",
+  "C:/Kompas Zbi\uFFFDrek",
+  "C:\\Kompas Zbi\u0102\u0142rek",
+  "C:/Kompas Zbi\u0102\u0142rek",
+  "C:\\Kompas Zbiórki",
+  "C:/Kompas Zbiórki",
+];
+
+/**
+ * Maps a workspace path that carries a known encoding-corrupted project root to
+ * the canonical root. Unknown paths containing U+FFFD are refused (blocked) so
+ * no new corrupt directory can be created from a garbage DB value.
+ */
+export function canonicalizeWorkspacePath(
+  value: string,
+): { path: string; repaired: boolean; blocked: boolean } {
+  const normalized = path.normalize(value);
+  for (const corruptRoot of KNOWN_CORRUPT_PROJECT_ROOTS) {
+    if (normalized === corruptRoot) {
+      return { path: CANONICAL_PROJECT_ROOT, repaired: true, blocked: false };
+    }
+    if (normalized.startsWith(`${corruptRoot}\\`) || normalized.startsWith(`${corruptRoot}/`)) {
+      return {
+        path: CANONICAL_PROJECT_ROOT + normalized.slice(corruptRoot.length),
+        repaired: true,
+        blocked: false,
+      };
+    }
+  }
+  if (normalized.includes("\uFFFD")) {
+    return { path: normalized, repaired: false, blocked: true };
+  }
+  return { path: normalized, repaired: false, blocked: false };
+}
+
+
+/**
+ * Reclaims a worktree path that exists on disk but is not a usable linked git
+ * worktree (missing, empty, or a plain folder without git metadata). Such a
+ * folder previously hard-failed workspace realization and every later run,
+ * including recovery runs, with `git_worktree_branch_incoherence`. Instead of
+ * blocking forever, move the leftover folder aside as a quarantine snapshot
+ * (never delete content) and let the caller rebuild a registered worktree.
+ */
+async function reclaimUnregisteredWorktreeDir(input: {
+  worktreePath: string;
+  repoRoot: string;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{ quarantined: boolean; quarantinePath: string | null }> {
+  if (!await directoryExists(input.worktreePath)) return { quarantined: false, quarantinePath: null };
+
+  const dirEntries = await fs.readdir(input.worktreePath).catch(() => null);
+  const isEmpty = dirEntries !== null && dirEntries.length === 0;
+  if (!isEmpty && await isGitCheckout(input.worktreePath)) {
+    // A real checkout with content is never moved silently; callers route that
+    // case through the strict validation-recovery contract.
+    return { quarantined: false, quarantinePath: null };
+  }
+
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const quarantinePath = `${input.worktreePath}.quarantine-${ts}`;
+  await fs.mkdir(path.dirname(quarantinePath), { recursive: true });
+  try {
+    await fs.rename(input.worktreePath, quarantinePath);
+    await input.recorder?.recordOperation({
+      phase: "worktree_prepare",
+      cwd: input.repoRoot,
+      metadata: {
+        repoRoot: input.repoRoot,
+        worktreePath: input.worktreePath,
+        quarantinePath,
+        cleanupAction: "quarantine_unregistered_worktree_dir",
+      },
+      run: async () => ({
+        status: "succeeded",
+        exitCode: 0,
+        system: `Quarantined unregistered worktree directory ${input.worktreePath} to ${quarantinePath}\n`,
+      }),
+    });
+    return { quarantined: true, quarantinePath };
+  } catch (renameErr) {
+    // A process may still hold a handle on the folder (Windows Permission denied).
+    // Fall back to removing only when the directory is empty; otherwise surface
+    // the real conflict instead of destroying unknown content.
+    if (isEmpty) {
+      await fs.rm(input.worktreePath, { recursive: true, force: true });
+      return { quarantined: true, quarantinePath: null };
+    }
+    throw new Error(
+      `Worktree path "${input.worktreePath}" is not a linked git worktree and could not be quarantined: ${renameErr instanceof Error ? renameErr.message : String(renameErr)}`,
+    );
+  }
+}
+
+
 async function resolvePathForWorktreeComparison(value: string): Promise<string> {
   const resolved = path.resolve(value);
   return fs.realpath(resolved).then((realPath) => path.resolve(realPath)).catch(() => resolved);
@@ -3016,10 +3118,17 @@ export async function realizeExecutionWorkspace(input: {
   });
   let branchName = sanitizeBranchName(renderedBranch);
   const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
-  const worktreeParentDir = configuredParentDir
-    ? resolveConfiguredPath(configuredParentDir, repoRoot)
-    : path.join(repoRoot, ".paperclip", "worktrees");
-  const worktreePath = path.join(worktreeParentDir, branchName);
+  const worktreeParentDir = canonicalizeWorkspacePath(
+    configuredParentDir
+      ? resolveConfiguredPath(configuredParentDir, repoRoot)
+      : path.join(repoRoot, ".paperclip", "worktrees"),
+  );
+  if (worktreeParentDir.blocked) {
+    throw new Error(
+      `Refusing to create a git worktree under "${worktreeParentDir.path}": the path contains an unrecoverable encoding-corrupted project root. Repair the workspace configuration before resuming.`,
+    );
+  }
+  const worktreePath = path.join(worktreeParentDir.path, branchName);
   let pendingForwardBranchReconcile: PendingForwardBranchReconcile | null = null;
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
     ? rawStrategy.baseRef
@@ -3035,7 +3144,7 @@ export async function realizeExecutionWorkspace(input: {
   ];
   const currentBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
 
-  await fs.mkdir(worktreeParentDir, { recursive: true });
+  await fs.mkdir(worktreeParentDir.path, { recursive: true });
 
   async function reuseExistingWorktree(reusablePath: string, effectiveBranchName = branchName, extraWarnings: string[] = []) {
     const refresh = currentBaseRefSha
@@ -3149,8 +3258,24 @@ export async function realizeExecutionWorkspace(input: {
       return await reuseExistingWorktree(worktreePath, reusable.branchName, reusable.warnings);
     }
     const validation = reusable.validation;
-    const reason = validation && !validation.valid ? ` (${validation.reason})` : "";
-    throw new Error(`Configured worktree path "${worktreePath}" already exists and is not a reusable git worktree${reason}.`);
+    if (!validation?.valid && !await isGitCheckout(worktreePath)) {
+      // The configured path exists but is not a linked worktree (empty folder or
+      // plain copy). Quarantine it and rebuild instead of hard-failing every run.
+      const reclaimed = await reclaimUnregisteredWorktreeDir({
+        worktreePath,
+        repoRoot,
+        recorder: input.recorder ?? null,
+      });
+      if (reclaimed.quarantined && reclaimed.quarantinePath) {
+        pendingForwardBranchReconcile = null;
+        baseRefreshWarnings.push(
+          `Reclaimed unregistered worktree path "${worktreePath}" (quarantined to "${reclaimed.quarantinePath}"); rebuilding a linked git worktree.`,
+        );
+      }
+    } else {
+      const reason = validation && !validation.valid ? ` (${validation.reason})` : "";
+      throw new Error(`Configured worktree path "${worktreePath}" already exists and is not a reusable git worktree${reason}.`);
+    }
   }
 
   const registeredBranchWorktree = await findRegisteredGitWorktreeByBranch(repoRoot, branchName);
@@ -3265,7 +3390,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   recorder?: WorkspaceOperationRecorder | null;
   resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<RealizedExecutionWorkspace | null> {
-  const cwd = asString(input.workspace.cwd ?? input.workspace.providerRef, "").trim();
+  const cwd = canonicalizeWorkspacePath(asString(input.workspace.cwd ?? input.workspace.providerRef, "").trim()).path;
   if (!cwd) return null;
 
   const strategy = input.workspace.strategyType === "git_worktree" ? "git_worktree" : "project_primary";
@@ -3316,7 +3441,8 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
     const reuseWorktreePath = realized.worktreePath ?? cwd;
     const repairWarnings: string[] = [];
-    if (await isGitCheckout(reuseWorktreePath)) {
+    const isCheckout = await isGitCheckout(reuseWorktreePath);
+    if (isCheckout) {
       const coherence = await ensureGitWorktreeBranchCoherent({
         db: input.db ?? null,
         repoRoot,
@@ -3345,59 +3471,84 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       expectedBranchName: realized.branchName,
     });
     if (!validation.valid) {
-      throw new WorkspaceRuntimeValidationFailure(
-        `Persisted git worktree "${reuseWorktreePath}" is not reusable (${validation.reason}).`,
-        {
-          workspaceValidation: {
-            reason: "git_worktree_not_reusable",
-            reasonCode: validation.reasonCode,
-            worktreePath: reuseWorktreePath,
-            executionWorkspaceId: input.workspace.id ?? null,
-          },
-        },
-      );
-    }
-    const baseRefreshWarnings = reuseBaseRef
-      ? await refreshRemoteTrackingBaseRef(repoRoot, reuseBaseRef, input.resolveGitAuth)
-      : [];
-    const currentBaseRefSha = reuseBaseRef ? await resolveBaseRefSha(repoRoot, reuseBaseRef) : null;
-    const refresh = reuseBaseRef && currentBaseRefSha
-      ? await refreshUnstartedWorktreeToBase({
-          repoRoot,
+      // Reclaim only paths without any git metadata (empty folders, plain
+      // copies — the classic half-removed-worktree leftover) or empty dirs.
+      // Those previously hard-failed every run, including recovery runs, with
+      // the same incoherence. A directory that still carries git metadata but
+      // is not registered keeps the strict validation-recovery contract so
+      // unknown content is never silently moved.
+      const dirEntries = await fs.readdir(reuseWorktreePath).catch(() => null);
+      const reclaimable = !isCheckout || (dirEntries !== null && dirEntries.length === 0);
+      if (reclaimable) {
+        const reclaimed = await reclaimUnregisteredWorktreeDir({
           worktreePath: reuseWorktreePath,
-          branchName: realized.branchName,
-          baseRef: reuseBaseRef,
-          currentBaseRefSha,
+          repoRoot,
           recorder: input.recorder ?? null,
-        })
-      : { refreshed: false, baseRefSha: null };
-    const baseDrift = await inspectExecutionWorkspaceBaseDrift({
-      repoRoot,
-      worktreePath: reuseWorktreePath,
-      branchName: realized.branchName,
-      baseRef: reuseBaseRef,
-      recordedBaseRefSha,
-      skipRefresh: true,
-    });
-    realized.warnings = [...repairWarnings, ...baseRefreshWarnings, ...baseDrift.warnings];
-    realized.baseRefSha = refresh.baseRefSha ?? recordedBaseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha;
-    if (provisionCommand) {
-      await provisionExecutionWorktree({
-        strategy: {
-          type: "git_worktree",
-          provisionCommand,
-        },
-        base: input.base,
+        });
+        repairWarnings.push(
+          `Persisted worktree "${reuseWorktreePath}" was not reusable (${validation.reason}); ` +
+          (reclaimed.quarantinePath
+            ? `quarantined to "${reclaimed.quarantinePath}" before rebuild.`
+            : "removed as an empty folder before rebuild."),
+        );
+        realized.warnings = repairWarnings;
+        // Fall through to the rebuild path below.
+      } else {
+        throw new WorkspaceRuntimeValidationFailure(
+          `Persisted git worktree "${reuseWorktreePath}" is not reusable (${validation.reason}).`,
+          {
+            workspaceValidation: {
+              reason: "git_worktree_not_reusable",
+              reasonCode: validation.reasonCode,
+              worktreePath: reuseWorktreePath,
+              executionWorkspaceId: input.workspace.id ?? null,
+            },
+          },
+        );
+      }
+    } else {
+      const baseRefreshWarnings = reuseBaseRef
+        ? await refreshRemoteTrackingBaseRef(repoRoot, reuseBaseRef, input.resolveGitAuth)
+        : [];
+      const currentBaseRefSha = reuseBaseRef ? await resolveBaseRefSha(repoRoot, reuseBaseRef) : null;
+      const refresh = reuseBaseRef && currentBaseRefSha
+        ? await refreshUnstartedWorktreeToBase({
+            repoRoot,
+            worktreePath: reuseWorktreePath,
+            branchName: realized.branchName,
+            baseRef: reuseBaseRef,
+            currentBaseRefSha,
+            recorder: input.recorder ?? null,
+          })
+        : { refreshed: false, baseRefSha: null };
+      const baseDrift = await inspectExecutionWorkspaceBaseDrift({
         repoRoot,
-        worktreePath: realized.worktreePath ?? cwd,
-        branchName: realized.branchName ?? "",
-        issue: input.issue,
-        agent: input.agent,
-        created: false,
-        recorder: input.recorder ?? null,
+        worktreePath: reuseWorktreePath,
+        branchName: realized.branchName,
+        baseRef: reuseBaseRef,
+        recordedBaseRefSha,
+        skipRefresh: true,
       });
+      realized.warnings = [...repairWarnings, ...baseRefreshWarnings, ...baseDrift.warnings];
+      realized.baseRefSha = refresh.baseRefSha ?? recordedBaseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha;
+      if (provisionCommand) {
+        await provisionExecutionWorktree({
+          strategy: {
+            type: "git_worktree",
+            provisionCommand,
+          },
+          base: input.base,
+          repoRoot,
+          worktreePath: realized.worktreePath ?? cwd,
+          branchName: realized.branchName ?? "",
+          issue: input.issue,
+          agent: input.agent,
+          created: false,
+          recorder: input.recorder ?? null,
+        });
+      }
+      return realized;
     }
-    return realized;
   }
 
   const worktreePath = realized.worktreePath ?? cwd;
@@ -3489,7 +3640,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     ...realized,
     cwd: worktreePath,
     worktreePath,
-    warnings: [...restoreRefreshWarnings, ...baseDrift.warnings],
+    warnings: [...(realized.warnings ?? []), ...restoreRefreshWarnings, ...baseDrift.warnings],
     created,
     baseRefSha:
       recordedBaseRefSha
@@ -3713,28 +3864,75 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       if (!repoRoot) {
         warnings.push(`Could not resolve git repo root for "${workspacePath}".`);
       } else {
+        // Remove with bounded retries. A concurrent adapter/shell that still has
+        // its cwd inside the worktree makes Windows return "Permission denied"
+        // on the first attempt even after the process has exited; a short backoff
+        // lets the OS release the handle. Each attempt is recorded separately.
+        const attempts = [
+          { delayMs: 0, useForce: input.forceWorktreeRemoval !== false },
+          { delayMs: 2_000, useForce: true },
+          { delayMs: 5_000, useForce: true },
+        ];
+        let removeError: unknown = null;
+        for (const attempt of attempts) {
+          if (attempt.delayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, attempt.delayMs));
+          }
+          if (!await directoryExists(workspacePath)) break;
+          try {
+            await input.assertSafeToCleanup?.();
+            await recordGitOperation(input.recorder, {
+              phase: "worktree_cleanup",
+              args: [
+                "worktree",
+                "remove",
+                ...(attempt.useForce ? ["--force"] : []),
+                workspacePath,
+              ],
+              cwd: repoRoot,
+              metadata: {
+                workspaceId: input.workspace.id,
+                workspacePath,
+                branchName: input.workspace.branchName,
+                cleanupAction: "worktree_remove",
+                retryDelayMs: attempt.delayMs,
+              },
+              successMessage: `Removed git worktree ${workspacePath}\n`,
+              failureLabel: `git worktree remove ${workspacePath}`,
+            });
+            removeError = null;
+            break;
+          } catch (err) {
+            removeError = err;
+          }
+        }
+        if (removeError !== null) {
+          warnings.push(removeError instanceof Error ? removeError.message : String(removeError));
+        }
+        // Drop stale worktree metadata regardless of whether the folder removal
+        // succeeded, then verify. A half-removed worktree (registration removed,
+        // folder still on disk) must not linger in `git worktree list`.
         try {
-          await input.assertSafeToCleanup?.();
           await recordGitOperation(input.recorder, {
             phase: "worktree_cleanup",
-            args: [
-              "worktree",
-              "remove",
-              ...(input.forceWorktreeRemoval === false ? [] : ["--force"]),
-              workspacePath,
-            ],
+            args: ["worktree", "prune"],
             cwd: repoRoot,
             metadata: {
               workspaceId: input.workspace.id,
               workspacePath,
-              branchName: input.workspace.branchName,
-              cleanupAction: "worktree_remove",
+              cleanupAction: "worktree_prune",
             },
-            successMessage: `Removed git worktree ${workspacePath}\n`,
-            failureLabel: `git worktree remove ${workspacePath}`,
+            successMessage: `Pruned stale git worktree registrations for ${workspacePath}\n`,
+            failureLabel: `git worktree prune`,
           });
         } catch (err) {
-          warnings.push(err instanceof Error ? err.message : String(err));
+          warnings.push(`git worktree prune failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        if (await directoryExists(workspacePath)) {
+          warnings.push(
+            `Execution workspace cleanup could not remove "${workspacePath}" after retries; ` +
+            `the folder will be retried by the next cleanup sweep and must not be force-deleted while a process may still hold it.`,
+          );
         }
       }
     }
@@ -3816,6 +4014,132 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     cleaned,
     warnings,
   };
+}
+
+/**
+ * Record the canonical delivery record for a git_worktree execution workspace.
+ * Paperclip verifies git itself instead of trusting the agent's comment:
+ * - result commit/branch from the worktree HEAD;
+ * - remote verification after `git fetch` of the pushed remote ref;
+ * - mergedToBase via ancestry of HEAD against the recorded base ref;
+ * - persisted deliveryState so dependency gates can read it without re-running git.
+ */
+export async function recordCanonicalWorkspaceDelivery(input: {
+  db: Db;
+  workspaceId: string;
+  repoRoot: string;
+  worktreePath: string;
+  branchName: string;
+  baseRef: string | null;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{
+  resultCommitSha: string | null;
+  resultBranch: string | null;
+  pushedRemote: string | null;
+  remoteRef: string | null;
+  remoteVerifiedSha: string | null;
+  mergedToBase: boolean | null;
+  deliveryState: "merged_by_ancestry" | "unmerged" | "unknown";
+}> {
+  const resultCommitSha = (await runGit(["rev-parse", "HEAD"], input.worktreePath).catch(() => null))?.trim() || null;
+  const resultBranch =
+    (await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], input.worktreePath).catch(() => null))?.trim()
+    || input.branchName;
+
+  let pushedRemote: string | null = null;
+  let remoteRef: string | null = null;
+  let remoteVerifiedSha: string | null = null;
+  if (resultCommitSha && resultBranch) {
+    const fetched = await runGit(["fetch", "origin", "--quiet"], input.repoRoot)
+      .then(() => true)
+      .catch(() => false);
+    if (fetched) {
+      remoteRef = `refs/remotes/origin/${resultBranch}`;
+      const remoteSha = (await runGit(["rev-parse", "--verify", `${remoteRef}^{commit}`], input.repoRoot)
+        .catch(() => null))?.trim() || null;
+      if (remoteSha === resultCommitSha) {
+        pushedRemote = "origin";
+        remoteVerifiedSha = remoteSha;
+      }
+    }
+  }
+
+  const baseHeadSha = input.baseRef
+    ? await resolveBaseRefSha(input.repoRoot, input.baseRef).catch(() => null)
+    : null;
+  let mergedToBase: boolean | null = null;
+  if (resultCommitSha && baseHeadSha) {
+    const merged = await runGit(
+      ["merge-base", "--is-ancestor", resultCommitSha, baseHeadSha],
+      input.repoRoot,
+    ).then(() => true).catch(() => false);
+    mergedToBase = merged;
+  }
+
+  const deliveryState: "merged_by_ancestry" | "unmerged" | "unknown" =
+    mergedToBase === true
+      ? "merged_by_ancestry"
+      : remoteVerifiedSha
+        ? "unmerged"
+        : "unknown";
+
+  try {
+    await input.db
+      .update(executionWorkspaces)
+      .set({
+        resultCommitSha,
+        resultBranch,
+        pushedRemote,
+        remoteRef,
+        remoteVerifiedSha,
+        mergedToBase,
+        deliveryState,
+        updatedAt: new Date(),
+      })
+      .where(eq(executionWorkspaces.id, input.workspaceId));
+    await input.recorder?.recordOperation({
+      phase: "workspace_finalize",
+      cwd: input.worktreePath,
+      metadata: {
+        repoRoot: input.repoRoot,
+        worktreePath: input.worktreePath,
+        workspaceId: input.workspaceId,
+        canonicalDelivery: {
+          resultCommitSha,
+          resultBranch,
+          pushedRemote,
+          remoteRef,
+          remoteVerifiedSha,
+          mergedToBase,
+          deliveryState,
+        },
+      },
+      run: async () => ({
+        status: "succeeded",
+        exitCode: 0,
+        system: `Recorded canonical delivery for ${input.branchName}: ${resultCommitSha ?? "no commit"} (${deliveryState})\n`,
+      }),
+    });
+  } catch (err) {
+    // Delivery recording is best-effort at finalize; the failure must not fail
+    // the run, but it must be visible so the operator can repair the record.
+    await input.recorder?.recordOperation({
+      phase: "workspace_finalize",
+      cwd: input.worktreePath,
+      metadata: {
+        repoRoot: input.repoRoot,
+        worktreePath: input.worktreePath,
+        workspaceId: input.workspaceId,
+        canonicalDeliveryError: err instanceof Error ? err.message : String(err),
+      },
+      run: async () => ({
+        status: "failed",
+        stderr: `Failed to persist canonical delivery record: ${err instanceof Error ? err.message : String(err)}\n`,
+      }),
+    });
+  }
+
+  return { resultCommitSha, resultBranch, pushedRemote, remoteRef, remoteVerifiedSha, mergedToBase, deliveryState };
 }
 
 /**

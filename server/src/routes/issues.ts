@@ -1912,6 +1912,36 @@ function isAssigneeSelfCommentOnTerminalIssue(input: {
   return input.actorId === input.assigneeAgentId;
 }
 
+function isAgentGeneratedSelfWakeComment(input: {
+  createdByRunId: string | null | undefined;
+  derivedAuthorAgentId: string | null | undefined;
+  actorAgentId: string | null | undefined;
+  actorRunId: string | null | undefined;
+  targetAgentId: string | null | undefined;
+}): boolean {
+  if (!input.targetAgentId) return false;
+  if (input.derivedAuthorAgentId && input.derivedAuthorAgentId === input.targetAgentId) return true;
+  if (input.actorAgentId && input.actorAgentId === input.targetAgentId) return true;
+  if (input.actorRunId && input.createdByRunId && input.actorRunId === input.createdByRunId) return true;
+  if (input.createdByRunId && input.actorAgentId === input.targetAgentId) return true;
+  return false;
+}
+
+async function resolveCommentEffectiveAuthorAgentId(
+  db: Db,
+  companyId: string,
+  comment: { createdByRunId: string | null | undefined; derivedAuthorAgentId?: string | null },
+): Promise<string | null> {
+  if (comment.derivedAuthorAgentId) return comment.derivedAuthorAgentId;
+  if (!comment.createdByRunId) return null;
+  const row = await db
+    .select({ agentId: heartbeatRuns.agentId })
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.id, comment.createdByRunId), eq(heartbeatRuns.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+  return row?.agentId ?? null;
+}
+
 function readToolActionExecutionStatus(value: unknown) {
   return value === "approved"
     || value === "executing"
@@ -10237,13 +10267,31 @@ export function issueRoutes(
       if (commentBody && comment) {
         const assigneeId = issue.assigneeAgentId;
         const actorIsAgent = actor.actorType === "agent";
-        const selfComment = actorIsAgent && actor.actorId === assigneeId;
-        // Re-derive closed-ness from the post-update issue so a status change
-        // like in_progress -> done with a closure comment does not enqueue a
-        // stale issue_commented wake for an already-completed issue.
-        const skipAssigneeCommentWake = selfComment || isClosedIssueStatus(issue.status);
-
-        if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
+        const derivedAgentAuthorId = await resolveCommentEffectiveAuthorAgentId(db, issue.companyId, comment);
+        const effectiveSelfComment = Boolean(
+          assigneeId && (
+            (derivedAgentAuthorId && derivedAgentAuthorId === assigneeId) ||
+            (comment.createdByRunId && actorIsAgent && actor.actorId === assigneeId) ||
+            (actorIsAgent && actor.actorId === assigneeId)
+          ),
+        );
+        const closed = isClosedIssueStatus(issue.status);
+        const patchIsAskInteractionOnly = Boolean(closed && !reopened && !effectiveSelfComment && resumeRequested !== true);
+        if (patchIsAskInteractionOnly) {
+          if (assigneeId && !assigneeChanged) {
+            addWakeup(assigneeId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_commented",
+              payload: { issueId: id, commentId: comment.id, mutation: "comment", interactionOnly: true, ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}), ...(interruptedRunId ? { interruptedRunId } : {}) },
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: { issueId: id, taskId: id, commentId: comment.id, wakeCommentId: comment.id, source: "issue.comment", wakeReason: "issue_commented", interactionOnly: true, ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}), ...(interruptedRunId ? { interruptedRunId } : {}) },
+            });
+          }
+        } else {
+          const skipAssigneeCommentWake = effectiveSelfComment || closed;
+          if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
           addWakeup(assigneeId, {
             source: "automation",
             triggerDetail: "system",
@@ -10284,6 +10332,7 @@ export function issueRoutes(
                 : {}),
             },
           });
+        }
         }
 
         let mentionedIds: string[] = [];
@@ -11694,7 +11743,7 @@ export function issueRoutes(
       actorType: actor.actorType,
       actorId: actor.actorId,
     });
-    const effectiveMoveToTodoRequested =
+    let effectiveMoveToTodoRequested =
       !assigneeSelfCommentOnTerminal &&
       (explicitMoveToTodoRequested ||
         shouldImplicitlyMoveCommentedIssueToTodo({
@@ -11707,6 +11756,11 @@ export function issueRoutes(
           executionRunId: issue.executionRunId,
         }) ||
         shouldResumeInProgressScheduledRetry);
+    let isAskInteractionOnly = false;
+    if (isClosedIssueStatus(issue.status) && effectiveMoveToTodoRequested && !explicitMoveToTodoRequested && resumeRequested !== true) {
+      isAskInteractionOnly = true;
+      effectiveMoveToTodoRequested = false;
+    }
     const hasUnresolvedFirstClassBlockers =
       isBlocked && effectiveMoveToTodoRequested
         ? (await svc.getDependencyReadiness(issue.id)).unresolvedBlockerCount > 0
@@ -12148,13 +12202,50 @@ export function issueRoutes(
 
       const assigneeId = currentIssue.assigneeAgentId;
       const actorIsAgent = actor.actorType === "agent";
-      const selfComment = actorIsAgent && actor.actorId === assigneeId;
-      // Re-derive closed-ness from the post-mutation issue so the auto-approval
-      // transition (in_review -> done) suppresses a stale `issue_commented` wake
-      // to the returnAssignee for an already-completed issue.
-      const skipWake = selfComment || isClosedIssueStatus(currentIssue.status);
-      if (assigneeId && (reopened || !skipWake)) {
-        if (reopened) {
+      const derivedAgentAuthorId = await resolveCommentEffectiveAuthorAgentId(db, currentIssue.companyId, comment);
+      const effectiveSelfComment = Boolean(
+        assigneeId && (
+          (derivedAgentAuthorId && derivedAgentAuthorId === assigneeId) ||
+          (comment.createdByRunId && actorIsAgent && actor.actorId === assigneeId) ||
+          (actorIsAgent && actor.actorId === assigneeId)
+        ),
+      );
+      const closed = isClosedIssueStatus(currentIssue.status);
+      if (effectiveSelfComment && closed) {
+        // self-wake suppressed - agent comment on own done issue is not user input
+      } else if (effectiveSelfComment && !closed) {
+        // still suppress self-comment wake when issue is open - agent talking to itself is not a wake trigger
+      } else if (isAskInteractionOnly) {
+        addWakeup(assigneeId!, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_commented",
+          payload: {
+            issueId: currentIssue.id,
+            commentId: comment.id,
+            mutation: "comment",
+            interactionOnly: true,
+            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+            ...(interruptedRunId ? { interruptedRunId } : {}),
+          },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: currentIssue.id,
+            taskId: currentIssue.id,
+            commentId: comment.id,
+            wakeCommentId: comment.id,
+            source: "issue.comment",
+            wakeReason: "issue_commented",
+            interactionOnly: true,
+            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+            ...(interruptedRunId ? { interruptedRunId } : {}),
+          },
+        });
+      } else {
+        const skipWake = effectiveSelfComment || closed;
+        if (assigneeId && (reopened || !skipWake)) {
+          if (reopened) {
           addWakeup(assigneeId, {
             source: "automation",
             triggerDetail: "system",
@@ -12221,6 +12312,7 @@ export function issueRoutes(
             },
           });
         }
+      }
       }
 
       let mentionedIds: string[] = [];

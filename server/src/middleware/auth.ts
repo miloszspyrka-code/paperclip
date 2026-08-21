@@ -58,6 +58,37 @@ function normalizeOptionalString(value: string | null | undefined) {
   return value?.trim() || null;
 }
 
+function isLoopbackIp(value: string) {
+  const trimmed = value.trim().replace(/^::ffff:/i, "");
+  if (trimmed === "::1" || trimmed === "127.0.0.1") return true;
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(trimmed)) return true;
+  return false;
+}
+
+/**
+ * Tunnel guard for `local_trusted` instances. The deployment is loopback-only
+ * by design, so the middleware grants the implicit `local-board` admin actor to
+ * any unauthenticated request — which is safe only while every peer really is
+ * the local operator. A public tunnel (Cloudflare Tunnel/Tailscale Funnel)
+ * terminates on loopback, making remote API calls look local and effectively
+ * exposing an unauthenticated admin API. When the request carries a real
+ * non-loopback client address in `cf-connecting-ip`/`x-forwarded-for`, treat it
+ * as remote: read-only methods keep the implicit actor (board viewing still
+ * works), but mutating methods require an explicit bearer token, which agents
+ * obtain through the managed MCP gateway instead of raw REST.
+ */
+function isTunneledRemoteRequest(req: Request): boolean {
+  if (process.env.PAPERCLIP_API_GUARD_TUNNEL === "0") return false;
+  const forwarded =
+    normalizeOptionalString(req.header("cf-connecting-ip")) ??
+    normalizeOptionalString(req.header("x-forwarded-for")?.split(",")[0] ?? null);
+  if (!forwarded) return false;
+  return !isLoopbackIp(forwarded);
+}
+
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+
 async function resolveLegacyRunResponsibleUserId(
   db: Db,
   input: { companyId: string; agentId: string; runId: string },
@@ -192,16 +223,19 @@ interface ActorMiddlewareOptions {
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
   return async (req, _res, next) => {
+    const tunneledRemote = isTunneledRemoteRequest(req);
     req.actor =
       opts.deploymentMode === "local_trusted"
-        ? {
-            type: "board",
-            userId: "local-board",
-            userName: "Local Board",
-            userEmail: null,
-            isInstanceAdmin: true,
-            source: "local_implicit",
-          }
+        ? tunneledRemote && MUTATING_METHODS.has(req.method)
+          ? { type: "none", source: "none" }
+          : {
+              type: "board",
+              userId: "local-board",
+              userName: "Local Board",
+              userEmail: null,
+              isInstanceAdmin: true,
+              source: "local_implicit",
+            }
         : { type: "none", source: "none" };
 
     const runIdHeader = req.header("x-paperclip-run-id");

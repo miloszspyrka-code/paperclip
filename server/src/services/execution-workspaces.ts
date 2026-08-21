@@ -1003,7 +1003,8 @@ function toExecutionWorkspace(
     strategyType: row.strategyType as ExecutionWorkspace["strategyType"],
     name: row.name,
     status: row.status as ExecutionWorkspace["status"],
-    deliveryState,
+    deliveryState:
+      (row.deliveryState as ExecutionWorkspaceDeliveryState | null) ?? deliveryState,
     cwd: row.cwd ?? null,
     repoUrl: row.repoUrl ?? null,
     baseRef: row.baseRef ?? null,
@@ -1021,6 +1022,14 @@ function toExecutionWorkspace(
     runtimeServices,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+    resultCommitSha: row.resultCommitSha ?? null,
+    resultBranch: row.resultBranch ?? null,
+    pushedRemote: row.pushedRemote ?? null,
+    remoteRef: row.remoteRef ?? null,
+    remoteVerifiedSha: row.remoteVerifiedSha ?? null,
+    mergedToBase: row.mergedToBase ?? null,
+    testsRun: row.testsRun ?? null,
+    testsPassed: row.testsPassed ?? null,
   };
 }
 
@@ -2693,6 +2702,80 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           });
         }
       }
+      // Retry pass for workspaces that previously failed cleanup (Windows handle
+      // contention, half-removed worktrees). Delivery is already recorded in the
+      // canonical columns; retry the removal once, and when the folder still
+      // cannot be deleted, quarantine it by rename instead of leaving an
+      // unregistered half-removed folder on disk forever.
+      const failedCleanupCandidates = await db
+        .select()
+        .from(executionWorkspaces)
+        .where(and(
+          eq(executionWorkspaces.status, "cleanup_failed"),
+          sql<boolean>`${executionWorkspaces.closedAt} IS NOT NULL`,
+          sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
+        ))
+        .limit(Math.max(0, limit));
+      for (const workspace of failedCleanupCandidates) {
+        const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+        if (!workspacePath) continue;
+        const stillExists = await fs.stat(workspacePath).then((s) => s.isDirectory()).catch(() => false);
+        if (!stillExists) {
+          await db
+            .update(executionWorkspaces)
+            .set({ status: "archived", cleanupReason: `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | retry_sweep_path_gone`, updatedAt: now() })
+            .where(eq(executionWorkspaces.id, workspace.id));
+          result.archived += 1;
+          continue;
+        }
+        const generation = readExecutionWorkspaceLifecycleGeneration(
+          workspace.metadata as Record<string, unknown> | null,
+        );
+        const expectedHeadSha = readNullableString(workspace.resultCommitSha);
+        try {
+          const cleanup = await cleanupTerminalWorkspace(workspace, expectedHeadSha, generation);
+          if (cleanup.cleaned) {
+            result.archived += 1;
+            continue;
+          }
+        } catch (err) {
+          // Fall through to quarantine below.
+        }
+        const quarantinePath = `${workspacePath}.quarantine-${now().toISOString().replace(/[:.]/g, "-")}`;
+        try {
+          await fs.rename(workspacePath, quarantinePath);
+          await db
+            .update(executionWorkspaces)
+            .set({
+              status: "archived",
+              cleanupReason: `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | quarantined to ${quarantinePath}`,
+              updatedAt: now(),
+            })
+            .where(eq(executionWorkspaces.id, workspace.id));
+          await logActivity(db, {
+            companyId: workspace.companyId,
+            actorType: "system",
+            actorId: "workspace_terminality_reaper",
+            action: "execution_workspace.issue_terminal_quarantined",
+            entityType: "execution_workspace",
+            entityId: workspace.id,
+            details: { sourceIssueId: workspace.sourceIssueId, quarantinePath },
+          });
+          result.archived += 1;
+        } catch (quarantineErr) {
+          result.cleanupFailed += 1;
+          logger.warn(
+            {
+              event: "execution_workspace.cleanup_retry_failed",
+              executionWorkspaceId: workspace.id,
+              workspacePath,
+              err: quarantineErr instanceof Error ? quarantineErr.message : String(quarantineErr),
+            },
+            "cleanup_failed workspace retry could not remove or quarantine the folder",
+          );
+        }
+      }
+
       return result;
       } finally {
         terminalSweepInProgress = false;
