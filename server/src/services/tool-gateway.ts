@@ -503,6 +503,50 @@ function shortStableId(id: string): string {
   return id.replace(/-/g, "").slice(0, 8);
 }
 
+export const MAX_PROVIDER_TOOL_NAME_LENGTH = 64;
+
+export function canonicalProviderToolName(originalName: string): string {
+  const allowedPattern = /^[a-zA-Z0-9_-]+$/;
+  const isAllowed = allowedPattern.test(originalName);
+  if (originalName.length <= MAX_PROVIDER_TOOL_NAME_LENGTH && isAllowed) {
+    return originalName;
+  }
+  if (originalName.length <= MAX_PROVIDER_TOOL_NAME_LENGTH && !isAllowed) {
+    const normalized = originalName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+    if (normalized.length <= MAX_PROVIDER_TOOL_NAME_LENGTH && normalized.length > 0) {
+      return normalized;
+    }
+  }
+  const hash = createHash("sha256").update(originalName).digest("hex").slice(0, 10);
+  const suffix = `_${hash}`;
+  const prefixLen = MAX_PROVIDER_TOOL_NAME_LENGTH - suffix.length;
+  const normalized = originalName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  const rawPrefix = normalized.length > 0 ? normalized : "tool";
+  const prefix = rawPrefix.slice(0, prefixLen).replace(/_+$/g, "") || "tool";
+  return `${prefix.slice(0, prefixLen)}${suffix}`;
+}
+
+const providerToolNameToOriginal = new Map<string, string>();
+const originalToolNameToProvider = new Map<string, string>();
+
+export function registerProviderToolNameMapping(originalName: string, providerName: string): void {
+  providerToolNameToOriginal.set(providerName, originalName);
+  originalToolNameToProvider.set(originalName, providerName);
+}
+
+export function resolveOriginalToolName(providerName: string): string | null {
+  return providerToolNameToOriginal.get(providerName) ?? null;
+}
+
+export function getProviderToolName(originalName: string): string | null {
+  return originalToolNameToProvider.get(originalName) ?? null;
+}
+
+export function clearProviderToolNameMappings(): void {
+  providerToolNameToOriginal.clear();
+  originalToolNameToProvider.clear();
+}
+
 function toolRequiresFormalApproval(tool: ToolGatewayDescriptor): boolean {
   return tool.risk === "destructive";
 }
@@ -881,11 +925,16 @@ export function createToolGatewayService(
       (connection.transport === "mcp_remote" && application.type === "mcp_http")
       || (connection.transport === "local_stdio" && application.type === "mcp_stdio")
     );
-    const baseNames = eligibleRows.map(({ catalogEntry, connection, application }) => {
+    const rawNames = eligibleRows.map(({ catalogEntry, connection, application }) => {
       const applicationKey = application.applicationKey ?? null;
       const connectionNamespace = `${slugSegment(applicationKey ?? connection.name ?? application.name, "mcp")}-${shortStableId(connection.id)}`;
       const toolSlug = slugSegment(catalogEntry.toolName, "tool");
       return `mcp.${connectionNamespace}:${toolSlug}`;
+    });
+    const baseNames = rawNames.map((raw) => {
+      const canonical = canonicalProviderToolName(raw);
+      if (canonical !== raw) registerProviderToolNameMapping(raw, canonical);
+      return canonical;
     });
     const baseNameCounts = baseNames.reduce<Map<string, number>>((counts, name) => {
       counts.set(name, (counts.get(name) ?? 0) + 1);
@@ -897,8 +946,14 @@ export function createToolGatewayService(
         throw new Error(`REST API connection ${connection.id} cannot be exposed through the MCP gateway`);
       }
       const baseName = baseNames[index]!;
+      const rawWithSuffix = `${rawNames[index]}-${shortStableId(catalogEntry.id)}`;
       const gatewayToolName = baseNameCounts.get(baseName)! > 1
-        ? `${baseName}-${shortStableId(catalogEntry.id)}`
+        ? (() => {
+            const canonical = canonicalProviderToolName(rawWithSuffix);
+            if (canonical !== rawWithSuffix) registerProviderToolNameMapping(rawWithSuffix, canonical);
+            if (canonical !== baseName) registerProviderToolNameMapping(baseName, canonical);
+            return canonical;
+          })()
         : baseName;
       const applicationKey = application.applicationKey ?? null;
       const inputSchema = catalogEntry.inputSchema ?? {};
@@ -1871,9 +1926,15 @@ export function createToolGatewayService(
     const connectedTools = await connectedMcpToolsForCompany(session.companyId);
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
-    const tool = [...allTools(), ...connectedTools, ...virtualTools]
-      .filter((candidate) => session.agentId || (candidate.providerType !== "paperclip_self" && candidate.providerType !== "paperclip_plugin"))
-      .find((candidate) => candidate.name === toolName);
+    const candidates = [...allTools(), ...connectedTools, ...virtualTools]
+      .filter((candidate) => session.agentId || (candidate.providerType !== "paperclip_self" && candidate.providerType !== "paperclip_plugin"));
+    let tool: ToolGatewayDescriptor | undefined = candidates.find((candidate) => candidate.name === toolName);
+    if (!tool) {
+      const original = resolveOriginalToolName(toolName);
+      if (original) {
+        tool = candidates.find((candidate) => candidate.name === original);
+      }
+    }
     if (!tool) {
       throw new ToolGatewayHttpError(404, `Tool "${toolName}" not found`, "tool_not_found", { tool: toolName });
     }

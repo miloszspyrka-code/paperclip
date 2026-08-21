@@ -511,6 +511,11 @@ export function agentService(db: Db) {
       assertBuiltInAgentMetadataMutationAllowed(existing.metadata, data.metadata, options);
     }
 
+    const isExplicitErrorClear = existing.status === "error" && data.status === "idle";
+    if (isExplicitErrorClear && !Object.prototype.hasOwnProperty.call(data, "errorReason")) {
+      (data as Record<string, unknown>).errorReason = null;
+    }
+
     const normalizedPatch = { ...data } as Partial<typeof agents.$inferInsert>;
     if (data.permissions !== undefined) {
       const role = (data.role ?? existing.role) as string;

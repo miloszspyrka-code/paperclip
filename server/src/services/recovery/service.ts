@@ -1195,6 +1195,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return Boolean(budgetBlock);
   }
 
+  async function hasActiveControlPlaneRecovery(issueId: string) {
+    const [row] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, issueId), inArray(issueRecoveryActions.status, ["active", "escalated"]))).limit(1);
+    return Boolean(row);
+  }
+
   async function reconcileUnassignedBlockingIssues() {
     const candidates = await db
       .select({
@@ -2585,7 +2590,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     const originalAgentId = input.latestRun?.agentId ?? input.issue.assigneeAgentId;
     const returnOwnerAgentId = input.issue.assigneeAgentId ?? originalAgentId;
-    const routeToOriginal = input.recoveryCause === "process_lost" ||
+    const isControlPlaneAdapterFailure = input.recoveryCause === "stranded_assigned_issue" && input.latestRun?.errorCode === "adapter_failed";
+    const routeToOriginal = isControlPlaneAdapterFailure ||
+      input.recoveryCause === "process_lost" ||
       input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON ||
       input.recoveryCause === "codex_output_inactivity_monitor";
     if (input.recoveryCause === "provider_quota") {
@@ -2762,7 +2769,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           input.latestRun?.id ?? "no-run",
         ].join(":"),
         billingCode: input.issue.billingCode,
-        inheritExecutionWorkspaceFromIssueId: input.issue.id,
+        // A recovery issue must never inherit the source issue's execution
+        // workspace. Inheriting a workspace that failed validation (e.g.
+        // git_worktree_branch_incoherence) re-runs the recovery owner inside the
+        // same broken workspace, fails the same validation, and poisons the whole
+        // escalation chain (COO/CEO both error). Recovery work is control-plane
+        // work and gets its own isolated workspace; the source workspace is
+        // repaired by the recovered execution path itself.
+        ...(recoveryCause === "workspace_validation_failed"
+          ? { executionWorkspacePreference: "isolated_workspace" as const }
+          : { inheritExecutionWorkspaceFromIssueId: input.issue.id }),
       });
     } catch (error) {
       if (!isUniqueStrandedIssueRecoveryConflict(error)) throw error;
@@ -3336,10 +3352,84 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    const isMissingDispositionExhausted = recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON;
+    const isControlPlaneAdapterFailure = recoveryCause === "stranded_assigned_issue" && input.latestRun?.errorCode === "adapter_failed" && blockerIds.length === 0;
+    if (isControlPlaneAdapterFailure) {
+      const preservedAssignee = input.issue.assigneeAgentId;
+      const updatedControlPlane = await issuesSvc.update(input.issue.id, {
+        status: "todo",
+        blockedByIssueIds: [],
+        ...(preservedAssignee ? { assigneeAgentId: preservedAssignee } : {}),
+      });
+      if (!updatedControlPlane) return null;
+      await logActivity(db, {
+        companyId: input.issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: input.issue.id,
+        details: {
+          identifier: input.issue.identifier,
+          status: "todo",
+          previousStatus: input.previousStatus,
+          source: "recovery.control_plane_adapter_failure",
+          recoveryCause,
+          latestRunId: input.latestRun?.id ?? null,
+          latestRunStatus: input.latestRun?.status ?? null,
+          latestRunErrorCode: input.latestRun?.errorCode ?? null,
+          recoveryActionId: recoveryAction.id,
+          recoveryOwnerAgentId: recoveryAction.ownerAgentId,
+          previousOwnerAgentId: recoveryAction.previousOwnerAgentId,
+          returnOwnerAgentId: recoveryAction.returnOwnerAgentId,
+          blockerIssueIds: [],
+          controlPlane: true,
+        },
+      });
+      return updatedControlPlane;
+    }
+    if (isMissingDispositionExhausted) {
+      const preservedAssignee = input.issue.assigneeAgentId;
+      const hasRealBlockers = blockerIds.length > 0;
+      if (!hasRealBlockers) {
+        const updatedMissing = await issuesSvc.update(input.issue.id, {
+          status: "todo",
+          blockedByIssueIds: [],
+          ...(preservedAssignee ? { assigneeAgentId: preservedAssignee } : {}),
+        });
+        if (!updatedMissing) return null;
+        await logActivity(db, {
+          companyId: input.issue.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: input.issue.id,
+          details: {
+            identifier: input.issue.identifier,
+            status: "todo",
+            previousStatus: input.previousStatus,
+            source: "recovery.missing_disposition_exhausted_no_blockers",
+            recoveryCause,
+            latestRunId: input.latestRun?.id ?? null,
+            latestRunStatus: input.latestRun?.status ?? null,
+            recoveryActionId: recoveryAction.id,
+            recoveryOwnerAgentId: recoveryAction.ownerAgentId,
+            blockerIssueIds: [],
+            controlPlane: true,
+          },
+        });
+        return updatedMissing;
+      }
+    }
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
-      assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+      assigneeAgentId: isMissingDispositionExhausted ? input.issue.assigneeAgentId : (recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId),
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
@@ -4088,6 +4178,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        if (await hasActiveControlPlaneRecovery(issue.id)) {
+          result.skipped += 1;
+          continue;
+        }
         if (await isInvocationBudgetBlocked(issue, agentId)) {
           result.skipped += 1;
           continue;
@@ -4275,6 +4369,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
       }
 
+      if (await hasActiveControlPlaneRecovery(issue.id)) {
+        result.skipped += 1;
+        continue;
+      }
       if (await isInvocationBudgetBlocked(issue, agentId)) {
         result.skipped += 1;
         continue;
