@@ -6,23 +6,28 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   CHATGPT_PUBLIC_TOOL_NAME_SET,
-  CHATGPT_PUBLIC_TOOL_NAMES,
   filterChatGptPublicTools,
 } from "./scripts/mcp-public-tool-catalog.mjs";
 import {
-  SKILL_CONTRACT_VERSION,
-  SKILL_REGISTRY,
-  MAX_HANDOFF_DEPTH,
-  buildOperationEnvelope,
-  resolveMode,
   enforceWriteGuard,
 } from "./scripts/paperclip-skill-contract.mjs";
+import { RefreshTokenStore } from "./mcp-public-gateway/refresh-token-store.mjs";
+import { createSkillOperationRouter } from "./mcp-public-gateway/skill-operation-router.mjs";
+import {
+  AuthorizationCodeStore,
+  OAUTH_SCOPES,
+  authorizationServerMetadata,
+  normalizeScope,
+  protectedResourceMetadata,
+} from "./mcp-public-gateway/oauth-flow.mjs";
+import { createHttpTransport, readBody, sendHtml, sendJson } from "./mcp-public-gateway/http-transport.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3103);
 const ISSUER = (process.env.MCP_PUBLIC_ISSUER || "https://mcp.kompaszbiorek.pl").replace(/\/+$/, "");
 const KEY_FILE = process.env.MCP_PUBLIC_KEY_FILE || join(__dirname, "secrets", "mcp-public.key");
 const CLIENTS_FILE = join(__dirname, "data", "mcp-public-clients.json");
+const REFRESH_TOKENS_FILE = process.env.MCP_PUBLIC_REFRESH_TOKENS_FILE || join(__dirname, "data", "mcp-public-refresh-tokens.json");
 const USER = process.env.MCP_PUBLIC_USER || "milos";
 const PASS = process.env.MCP_PUBLIC_PASS || "";
 const TARGETS_JSON = process.env.MCP_PUBLIC_TARGETS || "{}";
@@ -62,8 +67,8 @@ function saveClients() {
 }
 const CLIENTS = loadClients();
 
-const codes = new Map();
-const refreshTokens = new Map();
+const codes = new AuthorizationCodeStore({ ttlMs: CODE_TTL_MS });
+const refreshTokens = new RefreshTokenStore({ file: REFRESH_TOKENS_FILE, ttlMs: REFRESH_TOKEN_TTL_MS });
 const sessions = new Map();
 const failedLogins = new Map();
 
@@ -88,14 +93,6 @@ function verifyToken(jwt) {
 }
 function nowMs() { return Date.now(); }
 
-function sendJson(res, status, payload, extraHeaders = {}) {
-  res.writeHead(status, { "Content-Type": "application/json", ...extraHeaders });
-  res.end(JSON.stringify(payload));
-}
-function sendHtml(res, status, html) {
-  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-  res.end(html);
-}
 function esc(s) { return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 function constantTimeEq(a, b) {
   const ba = Buffer.from(String(a)); const bb = Buffer.from(String(b));
@@ -139,16 +136,6 @@ function clientIp(req) {
   const xff = (req.headers["x-forwarded-for"] || "").toString().trim();
   if (xff) return xff.split(",")[0].trim();
   return (req.socket.remoteAddress || "").replace(/^::ffff:/, "");
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.setEncoding("utf8");
-    req.on("data", (c) => { body += c; if (body.length > 1_000_000) { reject(new Error("body too large")); req.destroy(); } });
-    req.on("end", () => resolve(body));
-    req.on("error", reject);
-  });
 }
 
 function parseSkillFrontmatter(text) {
@@ -216,7 +203,7 @@ const PUBLIC_WRITE_TOOL_NAMES = new Set([
 ]);
 
 // ---------- OAuth model ----------
-const SCOPES = ["mcp:read", "mcp:write"];
+const SCOPES = OAUTH_SCOPES;
 
 function appForUrl(url) {
   const m = /^\/mcp(?:\/([a-zA-Z0-9_.-]+))?$/.exec(url.pathname);
@@ -263,7 +250,7 @@ function issueAccessToken(app, clientId, scope) {
 }
 
 // ---------- HTTP server ----------
-const server = http.createServer(async (req, res) => {
+const server = createHttpTransport(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const path = url.pathname;
   try {
@@ -274,32 +261,12 @@ const server = http.createServer(async (req, res) => {
       const resource = url.searchParams.get("resource") || `${ISSUER}/mcp`;
       const app = resourceName(resource);
       if (!app) return sendJson(res, 400, { error: "invalid_resource", error_description: "Unknown MCP resource" });
-      return sendJson(res, 200, {
-        resource: resourceUrlFor(app),
-        authorization_servers: [ISSUER],
-        scopes_supported: SCOPES,
-        resource_documentation: `${ISSUER}/health`,
-      }, { "Cache-Control": "public, max-age=3600", "Access-Control-Allow-Origin": "*" });
+      return sendJson(res, 200, protectedResourceMetadata({ issuer: ISSUER, app, resourceUrl: resourceUrlFor }), { "Cache-Control": "public, max-age=3600", "Access-Control-Allow-Origin": "*" });
     }
 
     // ---- authorization-server metadata (RFC 8414) ----
     if (path === "/.well-known/oauth-authorization-server" || path === "/.well-known/openid-configuration") {
-      return sendJson(res, 200, {
-        issuer: ISSUER,
-        authorization_endpoint: `${ISSUER}/oauth/authorize`,
-        token_endpoint: `${ISSUER}/oauth/token`,
-        registration_endpoint: `${ISSUER}/oauth/register`,
-        response_types_supported: ["code"],
-        grant_types_supported: ["authorization_code", "refresh_token"],
-        token_endpoint_auth_methods_supported: ["none"],
-        revocation_endpoint: `${ISSUER}/oauth/revoke`,
-        code_challenge_methods_supported: ["S256"],
-        authorization_response_iss_parameter_supported: true,
-        scopes_supported: SCOPES,
-        request_parameter_supported: false,
-        subject_types_supported: ["public"],
-        id_token_signing_alg_values_supported: ["HS256"],
-      }, { "Cache-Control": "public, max-age=3600", "Access-Control-Allow-Origin": "*" });
+      return sendJson(res, 200, authorizationServerMetadata(ISSUER), { "Cache-Control": "public, max-age=3600", "Access-Control-Allow-Origin": "*" });
     }
 
     // ---- dynamic client registration (RFC 7591) ----
@@ -316,7 +283,7 @@ const server = http.createServer(async (req, res) => {
         redirect_uris: redirectUris,
         token_endpoint_auth_method: "none",
         grant_types: ["authorization_code", "refresh_token"],
-        scope: String(body.scope || "mcp:read mcp:write"),
+        scope: normalizeScope(body.scope),
         created_at: new Date().toISOString(),
       };
       CLIENTS[client.client_id] = client;
@@ -331,7 +298,7 @@ const server = http.createServer(async (req, res) => {
       let clientId = q.get("client_id") || "";
       let redirectUri = q.get("redirect_uri") || "";
       const state = q.get("state") || "";
-      const scope = q.get("scope") || "mcp:read mcp:write";
+      const scope = normalizeScope(q.get("scope"));
       const resource = q.get("resource") || `${ISSUER}/mcp`;
       const codeChallenge = q.get("code_challenge") || "";
       const codeMethod = q.get("code_challenge_method") || "S256";
@@ -393,8 +360,7 @@ const fail = (error, description) => {
       }
       // consent
       const code = randToken(24);
-      codes.set(code, { clientId, redirectUri, state, scope, resource, codeChallenge, app, createdAt: nowMs(), used: false });
-      setTimeout(() => codes.delete(code), CODE_TTL_MS + 1000);
+      codes.issue(code, { clientId, redirectUri, state, scope, resource, codeChallenge, app });
       const params = new URLSearchParams({ code, iss: ISSUER });
       if (state) params.set("state", state);
       log("authorize ok", { client_id: clientId, app, scope });
@@ -443,8 +409,7 @@ const fail = (error, description) => {
             return sendJson(res, 400, { error: "invalid_grant", error_description: "redirect_uri mismatch" });
           }
         }
-        codeObj.used = true;
-        codes.delete(form.get("code"));
+        codes.consume(form.get("code"));
         const resource = form.get("resource") || codeObj.resource;
         const app = resourceName(resource);
         if (!app || app !== codeObj.app) {
@@ -453,7 +418,7 @@ const fail = (error, description) => {
         }
         const access = issueAccessToken(app, clientId, codeObj.scope);
         const refresh = randToken(40);
-        refreshTokens.set(refresh, { clientId, app, scope: codeObj.scope, createdAt: nowMs() });
+        refreshTokens.issue(refresh, { clientId, app, scope: codeObj.scope });
         log("token issued", { client_id: clientId, app, scope: codeObj.scope });
         return sendJson(res, 200, {
           access_token: access,
@@ -470,10 +435,9 @@ const fail = (error, description) => {
         const resource = form.get("resource") || resourceUrlFor(r.app);
         const app = resourceName(resource);
         if (!app || app !== r.app) return sendJson(res, 400, { error: "invalid_grant", error_description: "resource mismatch" });
-        refreshTokens.delete(refresh);
         const access = issueAccessToken(app, clientId, r.scope);
         const next = randToken(40);
-        refreshTokens.set(next, { ...r, createdAt: nowMs() });
+        refreshTokens.rotate(refresh, next);
         return sendJson(res, 200, {
           access_token: access,
           token_type: "Bearer",
@@ -489,7 +453,7 @@ const fail = (error, description) => {
     if (path === "/oauth/revoke" && req.method === "POST") {
       const form = new URLSearchParams(await readBody(req));
       const token = form.get("token") || "";
-      refreshTokens.delete(token);
+      refreshTokens.revoke(token);
       return sendJson(res, 200, {});
     }
 
@@ -497,12 +461,7 @@ const fail = (error, description) => {
     if (req.method === "GET" && path.startsWith("/mcp")) {
       const app = appForUrl(url);
       if (!app) return sendJson(res, 404, { error: "Unknown MCP app" });
-      return sendJson(res, 200, {
-        resource: resourceUrlFor(app),
-        authorization_servers: [ISSUER],
-        scopes_supported: SCOPES,
-        resource_documentation: `${ISSUER}/health`,
-      }, { "Cache-Control": "public, max-age=3600", "Access-Control-Allow-Origin": "*" });
+      return sendJson(res, 200, protectedResourceMetadata({ issuer: ISSUER, app, resourceUrl: resourceUrlFor }), { "Cache-Control": "public, max-age=3600", "Access-Control-Allow-Origin": "*" });
     }
     if (req.method === "POST" && path.startsWith("/mcp")) {
       if (path === "/mcp") return handleAggregate(req, res);
@@ -620,6 +579,14 @@ function upstreamCall(app, upSessionId, payload) {
   });
 }
 
+const skillOperationRouter = createSkillOperationRouter({
+  defaultApp: DEFAULT_APP,
+  operatorSkills: OPERATOR_SKILLS,
+  readSkill: (skillName) => readFileSync(join(SKILLS_ROOT, skillName, "SKILL.md"), "utf8"),
+  ensureUpSession,
+  upstreamCall,
+});
+
 function toolPrefix(app) { return `${app}__`; }
 
 function toolNameFor(app, raw) { return PREFIXED.includes(app) ? `${toolPrefix(app)}${raw}` : raw; }
@@ -645,34 +612,7 @@ async function ensureUpSession(ps, app) {
 }
 
 function gatewaySkillTools() {
-  return [
-    {
-      name: "paperclipListSkills",
-      description: "List available Paperclip skills with names, descriptions and aliases. Use to discover which skill matches the user request before loading it.",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false, "$schema": "http://json-schema.org/draft-07/schema#" },
-    },
-    {
-      name: "paperclipGetSkill",
-      description: "Get the full SKILL.md content for one Paperclip skill by name. Use after listing to load detailed instructions.",
-      inputSchema: { type: "object", properties: { name: { type: "string", enum: [...OPERATOR_SKILL_NAMES] } }, required: ["name"], additionalProperties: false, "$schema": "http://json-schema.org/draft-07/schema#" },
-    },
-    {
-      name: "paperclipUseSkill",
-      description: "Route a request through a Paperclip skill deterministically and return its execution envelope. Aliases map /debug /fix-tools /health /coo /runtime to skills.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          skill: { type: "string", enum: [...OPERATOR_SKILL_NAMES] },
-          request: { type: "string", minLength: 1 },
-          context: { type: "string" },
-          mode: { type: "string", enum: ["DIAGNOSE", "PLAN", "EXECUTE"], description: "Explicit mode override; EXECUTE requires operator mutation intent." },
-        },
-        required: ["skill", "request"],
-        additionalProperties: false,
-        "$schema": "http://json-schema.org/draft-07/schema#",
-      },
-    },
-  ];
+  return skillOperationRouter.skillTools();
 }
 
 async function aggregatedTools(ps) {
@@ -763,78 +703,8 @@ async function handleAggregate(req, res) {
 
   if (method === "tools/call") {
     const { app, name } = routeToolName(msg.params?.name || "");
-    if (name === "paperclipListSkills" && app === DEFAULT_APP) {
-      const skills = OPERATOR_SKILL_NAMES.map((n) => {
-        const s = OPERATOR_SKILLS.find((x) => x.frontmatter.name === n);
-        return { name: n, description: s?.frontmatter.description || "", uri: s?.uri || `skill://paperclip/${n}/SKILL.md`, aliases: n === "paperclip-debug-run" ? ["/debug","/debug-run"] : n === "paperclip-napraw-tools" ? ["/fix-tools","/tools"] : n === "paperclip-opencode-health" ? ["/health","/opencode-health"] : n === "paperclip-deleguj-coo" ? ["/coo","/delegate-coo"] : ["/runtime","/deploy-runtime"], useWhen: s?.frontmatter.description || "" };
-      });
-      return sendJson(res, 200, { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ skills }, null, 2) }], structuredContent: { skills } } });
-    }
-    if (name === "paperclipGetSkill" && app === DEFAULT_APP) {
-      const skillName = String(msg.params?.arguments?.name || "").trim();
-      const skill = OPERATOR_SKILLS.find((x) => x.frontmatter.name === skillName);
-      if (!skill) return sendJson(res, 400, { jsonrpc: "2.0", id, error: { code: -32602, message: `Unknown skill: ${skillName}` } });
-      const text = readFileSync(join(SKILLS_ROOT, skillName, "SKILL.md"), "utf8");
-      return sendJson(res, 200, { jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], structuredContent: { name: skillName, content: text } } });
-    }
-    if (name === "paperclipUseSkill" && app === DEFAULT_APP) {
-      const skillName = String(msg.params?.arguments?.skill || "").trim();
-      const request = String(msg.params?.arguments?.request || "").trim();
-      const context = String(msg.params?.arguments?.context || "").trim();
-      const explicitMode = msg.params?.arguments?.mode;
-      const skill = OPERATOR_SKILLS.find((x) => x.frontmatter.name === skillName);
-      if (!skill) return sendJson(res, 400, { jsonrpc: "2.0", id, error: { code: -32602, message: `Unknown skill: ${skillName}` } });
-      if (!request) return sendJson(res, 400, { jsonrpc: "2.0", id, error: { code: -32602, message: "request is required" } });
-      const aliasMap = { "/debug": "paperclip-debug-run", "/debug-run": "paperclip-debug-run", "/fix-tools": "paperclip-napraw-tools", "/tools": "paperclip-napraw-tools", "/health": "paperclip-opencode-health", "/opencode-health": "paperclip-opencode-health", "/coo": "paperclip-deleguj-coo", "/delegate-coo": "paperclip-deleguj-coo", "/runtime": "paperclip-wdroz-runtime", "/deploy-runtime": "paperclip-wdroz-runtime" };
-      const resolved = aliasMap[request.split(/\s+/)[0]] || skillName;
-      const registry = SKILL_REGISTRY[resolved];
-      const mode = resolveMode(request, { explicitMode });
-      // Open a server-side operation envelope for this session. The write
-      // guard enforces MODE/budget/scope on every subsequent mutating call.
-      const envelope = buildOperationEnvelope({
-        skill: resolved,
-        request,
-        mode,
-        target: context || null,
-        actor: payload?.sub ? `oauth:${payload.sub}` : "chatgpt-operator",
-      });
-      ps.operation = { envelope, writesUsed: 0 };
-      // Dynamic tool catalog metadata from the single source of truth.
-      let upstreamToolCount = 0;
-      try {
-        const rec = await ensureUpSession(ps, app);
-        if (!rec.tools) {
-          const lr = await upstreamCall(app, rec.upId, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
-          rec.tools = lr.json.result?.tools || [];
-        }
-        upstreamToolCount = rec.tools.length;
-      } catch {}
-      const publicToolCount = CHATGPT_PUBLIC_TOOL_NAMES.length;
-      const skillText = readFileSync(join(SKILLS_ROOT, resolved, "SKILL.md"), "utf8");
-      const guidance = `Skill ${resolved} v${registry.version} selected for request: "${request}"${context ? ` with context: ${context}` : ""}. MODE=${envelope.MODE}; WRITE_BUDGET=${envelope.WRITE_BUDGET}; writes are server-enforced (SKILL_WRITE_GUARD_DENIED on violation). Follow the skill instructions using the current Paperclip tool catalog (${publicToolCount} public tools; ${upstreamToolCount} tools in the full internal catalog).`;
-      return sendJson(res, 200, {
-        jsonrpc: "2.0",
-        id,
-        result: {
-          content: [{ type: "text", text: `${guidance}\n\n--- SKILL ---\n${skillText.slice(0, 8000)}` }],
-          structuredContent: {
-            selectedSkill: resolved,
-            skillVersion: registry.version,
-            contractVersion: SKILL_CONTRACT_VERSION,
-            mode: envelope.MODE,
-            allowedWrites: envelope.WRITE_BUDGET,
-            requiredContext: context || null,
-            handoffLimit: MAX_HANDOFF_DEPTH,
-            toolCatalogVersion: "chatgpt-public-1.3.0",
-            toolCount: publicToolCount,
-            upstreamToolCount,
-            operationId: envelope.OPERATION_ID,
-            aliases: registry.aliases,
-            writeGuard: "server-enforced",
-          },
-        },
-      });
-    }
+    const skillResponse = await skillOperationRouter.handle({ app, name, args: msg.params?.arguments, session: ps, payload });
+    if (skillResponse) return sendJson(res, skillResponse.error ? 400 : 200, { jsonrpc: "2.0", id, ...skillResponse });
     if (app === DEFAULT_APP && !CHATGPT_PUBLIC_TOOL_NAME_SET.has(name)) {
       return sendJson(res, 404, { jsonrpc: "2.0", id, error: { code: -32601, message: "Tool is not available in the public catalog" } });
     }

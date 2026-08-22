@@ -10,10 +10,12 @@ export const MAX_ADMIN_WRITES_PER_OPERATION = 3;
 export const MODES = ["DIAGNOSE", "PLAN", "EXECUTE"];
 export const RESULTS = ["PASS", "FAIL", "BLOCKED", "HANDOFF"];
 
-// PLAN intent markers. EXECUTE is NEVER inferred from text - it requires an
-// explicit mutation-intent parameter (explicitMode) from the caller/operator.
+// PLAN intent markers. Explicit EXECUTE markers take precedence over planning.
 const PLAN_INTENT_RE =
   /\b(zaplanuj|przygotuj\s+plan|plan\s+only|utworz\s+plan|propose\s+a\s+plan)\b/i;
+const REQUEST_EXECUTE_RE = /\bMODE\s*=\s*EXECUTE\b/i;
+const REPAIR_INTENT_RE = /\b(napraw\w*|popraw\w*|usun\w*|usuń\w*)\b/i;
+const CHANGE_INTENT_RE = /\b(wykonaj\s+zmian\w*|wprowadz\w*\s+zmian\w*|wprowadź\s+zmian\w*|wdroz\w*|wdroż\w*|zaimplementuj\w*|zastosuj\s+zmian\w*)\b/i;
 
 // Machine-readable registry. Frontmatter stays minimal (name/description) for
 // parser compatibility; versions and write policy live here.
@@ -57,15 +59,20 @@ export const SKILL_REGISTRY = {
   },
 };
 
-// Mode resolution: explicit mode wins (validated); regex may propose DIAGNOSE
-// or PLAN only; uncertainty resolves to DIAGNOSE. EXECUTE requires explicitMode.
+// Mode resolution is deliberately conservative: only explicit markers or the
+// conjunction of repair and change intent can enter EXECUTE.
 export function resolveMode(request, { explicitMode } = {}) {
+  if (explicitMode !== undefined && !MODES.includes(explicitMode)) {
+    throw new Error(`Invalid explicit mode: ${explicitMode}`);
+  }
+  if (explicitMode === "EXECUTE") return "EXECUTE";
+  const text = String(request || "");
+  if (REQUEST_EXECUTE_RE.test(text)) return "EXECUTE";
   if (explicitMode !== undefined) {
-    if (!MODES.includes(explicitMode)) throw new Error(`Invalid explicit mode: ${explicitMode}`);
     return explicitMode;
   }
-  const text = String(request || "");
   if (!text.trim()) return "DIAGNOSE";
+  if (REPAIR_INTENT_RE.test(text) && CHANGE_INTENT_RE.test(text)) return "EXECUTE";
   if (PLAN_INTENT_RE.test(text)) return "PLAN";
   return "DIAGNOSE";
 }

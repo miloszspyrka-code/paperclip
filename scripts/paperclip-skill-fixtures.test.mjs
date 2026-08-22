@@ -180,19 +180,22 @@ test("handoff loop A -> B -> A terminates with HANDOFF_LOOP_BLOCKED", () => {
   assert.equal(handoffGuard(["paperclip-debug-run"], "paperclip-napraw-tools").allowed, true);
 });
 
-test("mode invariant - regex can never produce EXECUTE; explicit mode wins", () => {
-  // Mutation-flavored text without explicitMode stays DIAGNOSE.
+test("mode invariant - only unambiguous mutation intent enters EXECUTE", () => {
+  // Conditional or investigative mutation language stays DIAGNOSE.
   for (const request of [
     "sprawdz i jak trzeba napraw",
     "zobacz co nie działa i popraw",
     "napraw tylko jeżeli to bezpieczne",
     "oceń czy wymaga wdrożenia",
-    "napraw i wdrozy izolacje",
+    "wykonaj zmiany, jeśli okażą się konieczne",
   ]) {
     assert.equal(resolveMode(request), "DIAGNOSE");
   }
-  // Explicit operator intent is the only path to EXECUTE.
+  assert.equal(resolveMode("napraw integrację i wykonaj zmiany"), "EXECUTE");
+  assert.equal(resolveMode("MODE=EXECUTE napraw integrację"), "EXECUTE");
+  // The tool argument is the highest-priority explicit signal.
   assert.equal(resolveMode("cokolwiek", { explicitMode: "EXECUTE" }), "EXECUTE");
+  assert.equal(resolveMode("MODE=EXECUTE przygotuj plan", { explicitMode: "PLAN" }), "EXECUTE");
   assert.throws(() => resolveMode("x", { explicitMode: "MUTATE" }));
 });
 
