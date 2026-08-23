@@ -55,7 +55,24 @@ export function createSkillOperationRouter({ defaultApp, operatorSkills, readSki
   async function handle({ app, name, args, session, payload }) {
     if (app !== defaultApp || !["paperclipListSkills", "paperclipGetSkill", "paperclipUseSkill"].includes(name)) return null;
     if (name === "paperclipListSkills") {
-      return { result: { skills: operatorSkills.map((skill) => ({ name: skill.name, description: skill.frontmatter.description || "", uri: skill.uri, aliases: SKILL_REGISTRY[skill.name].aliases, useWhen: skill.frontmatter.description || "" })) } };
+      return { result: { skills: operatorSkills.map((skill) => {
+        const registry = SKILL_REGISTRY[skill.name];
+        const mode = skill.frontmatter.mode || (registry.modes.length === 1 ? registry.modes[0] : registry.modes.includes("PLAN") ? "PLAN" : "DIAGNOSE");
+        return {
+          name: skill.name,
+          version: skill.frontmatter.version || registry.version,
+          description: skill.frontmatter.description || "",
+          uri: skill.uri,
+          aliases: registry.aliases,
+          useWhen: skill.frontmatter.description || "",
+          mode,
+          readOnly: mode !== "EXECUTE",
+          requiredTools: skill.frontmatter.requiredTools ? skill.frontmatter.requiredTools.split(",").map((tool) => tool.trim()).filter(Boolean) : [],
+          capabilities: skill.frontmatter.capabilities ? skill.frontmatter.capabilities.split(",").map((capability) => capability.trim()).filter(Boolean) : [],
+          ...(skill.frontmatter.writeScope ? { writeScope: skill.frontmatter.writeScope } : {}),
+          ...(skill.frontmatter.requiresExpectedHash === "true" ? { requiresExpectedHash: true } : {}),
+        };
+      }) } };
     }
     if (name === "paperclipGetSkill") {
       const skillName = String(args?.name || "").trim();

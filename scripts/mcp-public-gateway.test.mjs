@@ -32,7 +32,7 @@ async function waitFor(url, child) {
   throw new Error("Gateway did not start");
 }
 
-async function startGateway({ storage, upstreamPort, refreshTtlMs = "10000" }) {
+async function startGateway({ storage, upstreamPort, refreshTtlMs = "10000", principals = {} }) {
   const portServer = http.createServer();
   const port = await listen(portServer);
   await close(portServer);
@@ -47,6 +47,8 @@ async function startGateway({ storage, upstreamPort, refreshTtlMs = "10000" }) {
       MCP_PUBLIC_PASS: "gateway-test-pass",
       MCP_PUBLIC_KEY_FILE: join(storage, "signing.key"),
       MCP_PUBLIC_REFRESH_TOKENS_FILE: join(storage, "refresh-tokens.json"),
+      MCP_PUBLIC_AUDIT_FILE: join(storage, "audit.jsonl"),
+      MCP_PUBLIC_PRINCIPALS: JSON.stringify(principals),
       MCP_PUBLIC_REFRESH_TTL_MS: refreshTtlMs,
       MCP_PUBLIC_TARGETS: JSON.stringify({ paperclip: { url: `http://127.0.0.1:${upstreamPort}/mcp` } }),
     },
@@ -217,4 +219,108 @@ test("public gateway routes skill modes through JSON-RPC and persists rotated re
   const expired = await refresh(gateway.base, expiring.client.client_id, expiring.token.refresh_token);
   assert.equal(expired.status, 400);
   assert.equal(expired.json.error, "invalid_grant");
+});
+
+test("public document and Wiki surface enforces scopes, grants, proposals, and resource descriptions", async (t) => {
+  const storage = mkdtempSync(join(root, ".tmp-mcp-public-surface-"));
+  const companyId = "11111111-1111-1111-1111-111111111111";
+  let page = "---\ntitle: Sprawności API\ndescription: Reguły pobierania i interpretacji danych API sprawności.\ntags:\n  - api\n---\n\n# Sprawności API\n\nInitial rule.\n";
+  let documentBody = "Initial document.";
+  let documentRevision = "rev-1";
+  const pageHash = () => createHash("sha256").update(page).digest("hex");
+  const upstream = http.createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const message = JSON.parse(body || "{}");
+    const name = message.params?.name;
+    const args = message.params?.arguments || {};
+    let result;
+    if (message.method === "initialize") result = { protocolVersion: "2025-03-26", capabilities: {} };
+    else if (message.method === "tools/list") result = { tools: ["paperclipListDocuments", "paperclipGetDocument"].map((tool) => ({ name: tool, description: tool, inputSchema: { type: "object" } })) };
+    else if (name === "wiki_list_pages") result = { structuredContent: { pages: [{ path: "wiki/sprawnosci-api.md", title: "Sprawności API", description: "Reguły pobierania i interpretacji danych API sprawności.", tags: ["api"], contentHash: pageHash(), updatedAt: "2026-08-23T00:00:00.000Z" }] } };
+    else if (name === "wiki_search") result = { structuredContent: { results: [{ kind: "page", path: "wiki/sprawnosci-api.md", title: "Sprawności API", hash: pageHash(), tags: ["api"] }] } };
+    else if (name === "wiki_read_page") result = { structuredContent: { contents: page, hash: pageHash() } };
+    else if (name === "wiki_write_page") {
+      if (args.expectedHash !== pageHash()) return res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "Refusing to overwrite stale page: expected hash" } }));
+      page = args.contents;
+      result = { structuredContent: { hash: pageHash() } };
+    } else if (name === "paperclipGetIssue") result = { structuredContent: { id: args.issueId, companyId } };
+    else if (name === "paperclipListDocuments") result = { structuredContent: { documents: [{ id: "doc-1", key: "plan", title: "Plan", latestRevisionId: documentRevision, updatedAt: "2026-08-23T00:00:00.000Z" }] } };
+    else if (name === "paperclipGetDocument") result = { structuredContent: { id: "doc-1", key: "plan", body: documentBody, latestRevisionId: documentRevision, companyId } };
+    else if (name === "paperclipListDocumentRevisions") result = { structuredContent: { revisions: [{ id: "rev-1", body: "Initial document." }, { id: documentRevision, body: documentBody }] } };
+    else if (name === "paperclipUpsertIssueDocument") {
+      if (args.baseRevisionId !== documentRevision) return res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "Document was updated by someone else: currentRevisionId" } }));
+      documentBody = args.body;
+      documentRevision = "rev-2";
+      result = { structuredContent: { id: "doc-1", key: "plan", body: documentBody, latestRevisionId: documentRevision, companyId } };
+    } else if (name === "paperclipListIssues") result = { structuredContent: { issues: [] } };
+    else result = { structuredContent: {} };
+    res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "surface-upstream" });
+    res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+  });
+  const upstreamPort = await listen(upstream);
+  const gateway = await startGateway({ storage, upstreamPort, principals: { "gateway-test-user": { sub: "paperclip-user", companyIds: [companyId] } } });
+  t.after(async () => {
+    await stopGateway(gateway.process);
+    await close(upstream);
+    rmSync(storage, { recursive: true, force: true });
+  });
+
+  const readAuth = await authenticate(gateway.base, "mcp:read paperclip:documents:read paperclip:wiki:read");
+  const initialized = await rpc(gateway.base, readAuth.token.access_token, 1, "initialize", { protocolVersion: "2025-03-26", capabilities: {} });
+  const session = initialized.session;
+  const tools = await rpc(gateway.base, readAuth.token.access_token, 2, "tools/list", {}, session);
+  assert.ok(tools.json.result.tools.some((tool) => tool.name === "paperclipWikiApplyChange"));
+  assert.ok(!tools.json.result.tools.some((tool) => tool.name === "paperclipApiRequest"));
+  const resources = await rpc(gateway.base, readAuth.token.access_token, 3, "resources/list", {}, session);
+  assert.equal(resources.status, 200);
+  assert.equal(resources.json.result.resources[0].name, "Sprawności API");
+  assert.equal(resources.json.result.resources[0].description, "Reguły pobierania i interpretacji danych API sprawności.");
+  const resourceRead = await rpc(gateway.base, readAuth.token.access_token, 31, "resources/read", { uri: resources.json.result.resources[0].uri }, session);
+  assert.match(resourceRead.json.result.contents[0].text, /Initial rule/);
+  const skills = await rpc(gateway.base, readAuth.token.access_token, 4, "skills/list", {}, session);
+  assert.equal(skills.json.result.skills.find((skill) => skill.name === "wiki-propose-change").mode, "PLAN");
+  assert.equal(skills.json.result.skills.find((skill) => skill.name === "wiki-apply-change").requiresExpectedHash, true);
+  const read = await rpc(gateway.base, readAuth.token.access_token, 5, "tools/call", { name: "paperclipWikiGetPage", arguments: { page: "wiki/sprawnosci-api.md" } }, session);
+  assert.match(read.json.result.structuredContent.content, /Initial rule/);
+  const deniedWrite = await rpc(gateway.base, readAuth.token.access_token, 6, "tools/call", { name: "paperclipWikiProposeChange", arguments: { page: "wiki/sprawnosci-api.md", expectedHash: pageHash(), content: page } }, session);
+  assert.equal(deniedWrite.status, 403);
+  assert.equal(deniedWrite.json.error.data.code, "INSUFFICIENT_SCOPE");
+  const forbidden = await rpc(gateway.base, readAuth.token.access_token, 7, "tools/call", { name: "paperclipWikiGetPage", arguments: { page: "%2e%2e/raw/secret.md" } }, session);
+  assert.equal(forbidden.json.error.data.code, "WIKI_PATH_FORBIDDEN");
+  const wrongCompany = await rpc(gateway.base, readAuth.token.access_token, 8, "tools/call", { name: "paperclipWikiGetPage", arguments: { companyId: "22222222-2222-2222-2222-222222222222", page: "wiki/sprawnosci-api.md" } }, session);
+  assert.equal(wrongCompany.json.error.data.code, "COMPANY_ACCESS_DENIED");
+  const documents = await rpc(gateway.base, readAuth.token.access_token, 81, "tools/call", { name: "paperclipListDocuments", arguments: { issueId: "issue-1" } }, session);
+  assert.equal(documents.json.result.structuredContent.documents[0].latestRevisionId, "rev-1");
+  const documentHistory = await rpc(gateway.base, readAuth.token.access_token, 82, "tools/call", { name: "paperclipGetDocumentHistory", arguments: { issueId: "issue-1", key: "plan" } }, session);
+  assert.equal(documentHistory.json.result.structuredContent.revisions[0].id, "rev-1");
+  const documentWriteDenied = await rpc(gateway.base, readAuth.token.access_token, 83, "tools/call", { name: "paperclipUpdateDocument", arguments: { issueId: "issue-1", key: "plan", baseRevisionId: "rev-1", content: "No permission." } }, session);
+  assert.equal(documentWriteDenied.status, 403);
+
+  const writeAuth = await authenticate(gateway.base, "mcp:read paperclip:wiki:read paperclip:wiki:write");
+  const writeInit = await rpc(gateway.base, writeAuth.token.access_token, 9, "initialize", { protocolVersion: "2025-03-26", capabilities: {} });
+  const writeSession = writeInit.session;
+  const oldHash = pageHash();
+  const proposal = await rpc(gateway.base, writeAuth.token.access_token, 10, "tools/call", { name: "paperclipWikiProposeChange", arguments: { page: "wiki/sprawnosci-api.md", expectedHash: oldHash, content: page.replace("Initial", "Updated") } }, writeSession);
+  assert.equal(proposal.json.result.structuredContent.baseHash, oldHash);
+  assert.equal(pageHash(), oldHash);
+  const applied = await rpc(gateway.base, writeAuth.token.access_token, 11, "tools/call", { name: "paperclipWikiApplyChange", arguments: { proposalId: proposal.json.result.structuredContent.proposalId, expectedHash: oldHash } }, writeSession);
+  assert.equal(applied.json.result.structuredContent.previousHash, oldHash);
+  assert.notEqual(applied.json.result.structuredContent.newHash, oldHash);
+  const replay = await rpc(gateway.base, writeAuth.token.access_token, 12, "tools/call", { name: "paperclipWikiApplyChange", arguments: { proposalId: proposal.json.result.structuredContent.proposalId, expectedHash: oldHash } }, writeSession);
+  assert.deepEqual(replay.json.result.structuredContent, applied.json.result.structuredContent);
+  const staleBase = pageHash();
+  const staleProposal = await rpc(gateway.base, writeAuth.token.access_token, 13, "tools/call", { name: "paperclipWikiProposeChange", arguments: { page: "wiki/sprawnosci-api.md", expectedHash: staleBase, content: `${page}\nSecond update.\n` } }, writeSession);
+  page = `${page}\nConcurrent update.\n`;
+  const staleApply = await rpc(gateway.base, writeAuth.token.access_token, 14, "tools/call", { name: "paperclipWikiApplyChange", arguments: { proposalId: staleProposal.json.result.structuredContent.proposalId, expectedHash: staleBase } }, writeSession);
+  assert.equal(staleApply.json.error.data.code, "WIKI_HASH_CONFLICT");
+  assert.match(page, /Concurrent update/);
+
+  const documentAuth = await authenticate(gateway.base, "mcp:read paperclip:documents:read paperclip:documents:write");
+  const documentInit = await rpc(gateway.base, documentAuth.token.access_token, 15, "initialize", { protocolVersion: "2025-03-26", capabilities: {} });
+  const documentSession = documentInit.session;
+  const documentUpdate = await rpc(gateway.base, documentAuth.token.access_token, 16, "tools/call", { name: "paperclipUpdateDocument", arguments: { issueId: "issue-1", key: "plan", baseRevisionId: "rev-1", content: "Updated document." } }, documentSession);
+  assert.equal(documentUpdate.json.result.structuredContent.latestRevisionId, "rev-2");
+  const staleDocument = await rpc(gateway.base, documentAuth.token.access_token, 17, "tools/call", { name: "paperclipUpdateDocument", arguments: { issueId: "issue-1", key: "plan", baseRevisionId: "rev-1", content: "Must not overwrite." } }, documentSession);
+  assert.equal(staleDocument.json.error.data.code, "DOCUMENT_REVISION_CONFLICT");
 });

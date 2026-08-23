@@ -15,7 +15,17 @@ export const CHATGPT_PUBLIC_TOOL_NAMES = [
   "paperclipCreateIssue",
   "paperclipUpdateIssue",
   "paperclipAddComment",
-  "paperclipApiRequest",
+  "paperclipListDocuments",
+  "paperclipGetDocument",
+  "paperclipGetDocumentHistory",
+  "paperclipGetDocumentRevision",
+  "paperclipUpdateDocument",
+  "paperclipWikiList",
+  "paperclipWikiSearch",
+  "paperclipWikiGetPage",
+  "paperclipWikiGetMetadata",
+  "paperclipWikiProposeChange",
+  "paperclipWikiApplyChange",
   "paperclipListSkills",
   "paperclipGetSkill",
   "paperclipUseSkill",
@@ -40,7 +50,17 @@ export const CHATGPT_PUBLIC_TOOL_DESCRIPTIONS = {
   paperclipCreateIssue: "Create a Paperclip task/issue with optional assignment, priority, project, goal, dependencies, and execution settings.",
   paperclipUpdateIssue: "Update a Paperclip task/issue including status, owner, priority, dependencies, execution settings, or comment.",
   paperclipAddComment: "Add a comment or instruction to one Paperclip task/issue, optionally resuming or interrupting execution.",
-  paperclipApiRequest: "Call an existing Paperclip /api endpoint not covered by a dedicated tool; normal authentication and permissions still apply.",
+  paperclipListDocuments: "List documents attached to one accessible Paperclip issue, including current revision metadata. This is read-only.",
+  paperclipGetDocument: "Get the current contents and metadata for one accessible Paperclip issue document. This is read-only.",
+  paperclipGetDocumentHistory: "List version history for one accessible Paperclip issue document. This is read-only.",
+  paperclipGetDocumentRevision: "Get one specific revision of an accessible Paperclip issue document. This is read-only.",
+  paperclipUpdateDocument: "Create a new document revision only when baseRevisionId matches the current revision. Returns DOCUMENT_REVISION_CONFLICT instead of overwriting a concurrent change.",
+  paperclipWikiList: "List safe, editable Wiki pages with descriptions, current hashes, and recommended skills. It never returns raw sources or runtime files.",
+  paperclipWikiSearch: "Search safe Wiki page metadata and return compact matches without returning every page body. This is read-only.",
+  paperclipWikiGetPage: "Read one safe Wiki markdown page and its current hash. It rejects raw, template, runtime, and traversal paths.",
+  paperclipWikiGetMetadata: "Get safe Wiki page metadata, including description, type, hash, editability, and recommended skills. This is read-only.",
+  paperclipWikiProposeChange: "Prepare a non-mutating Wiki page replacement and diff after verifying expectedHash. It creates a proposal but never writes the Wiki.",
+  paperclipWikiApplyChange: "Apply a previously prepared Wiki proposal only when expectedHash still matches the page. Returns WIKI_HASH_CONFLICT instead of overwriting concurrent edits.",
   paperclipListSkills: "List available Paperclip skills with names, descriptions and aliases. Use to discover which skill matches the user request before loading it.",
   paperclipGetSkill: "Get the full SKILL.md content for one Paperclip skill by name. Use after listing to load detailed instructions.",
   paperclipUseSkill: "Route a request through a Paperclip skill deterministically and return its execution envelope. Aliases map /debug /fix-tools /health /coo /runtime to skills.",
@@ -53,3 +73,21 @@ export function filterChatGptPublicTools(tools) {
     return tool ? [{ ...tool, description: CHATGPT_PUBLIC_TOOL_DESCRIPTIONS[name] }] : [];
   });
 }
+
+const companyId = { type: "string", format: "uuid", description: "Optional selection from the authenticated principal's granted companies." };
+
+export const PUBLIC_GATEWAY_TOOLS = [
+  ["paperclipGetDocumentHistory", { issueId: { type: "string" }, key: { type: "string" } }, ["issueId", "key"]],
+  ["paperclipGetDocumentRevision", { issueId: { type: "string" }, key: { type: "string" }, revisionId: { type: "string" } }, ["issueId", "key", "revisionId"]],
+  ["paperclipUpdateDocument", { issueId: { type: "string" }, key: { type: "string" }, baseRevisionId: { type: "string" }, content: { type: "string" }, title: { type: "string" }, changeSummary: { type: "string" } }, ["issueId", "key", "baseRevisionId", "content"]],
+  ["paperclipWikiList", { companyId, spaceSlug: { type: "string" } }, []],
+  ["paperclipWikiSearch", { companyId, spaceSlug: { type: "string" }, query: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: 50 } }, ["query"]],
+  ["paperclipWikiGetPage", { companyId, spaceSlug: { type: "string" }, page: { type: "string" } }, ["page"]],
+  ["paperclipWikiGetMetadata", { companyId, spaceSlug: { type: "string" }, page: { type: "string" } }, ["page"]],
+  ["paperclipWikiProposeChange", { companyId, spaceSlug: { type: "string" }, page: { type: "string" }, expectedHash: { type: "string" }, content: { type: "string" }, summary: { type: "string" } }, ["page", "expectedHash", "content"]],
+  ["paperclipWikiApplyChange", { proposalId: { type: "string" }, expectedHash: { type: "string" } }, ["proposalId", "expectedHash"]],
+].map(([name, properties, required]) => ({
+  name,
+  description: CHATGPT_PUBLIC_TOOL_DESCRIPTIONS[name],
+  inputSchema: { type: "object", properties, required, additionalProperties: false, "$schema": "http://json-schema.org/draft-07/schema#" },
+}));

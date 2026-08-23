@@ -1648,10 +1648,30 @@ async function resolveSelectedProject(ctx: PluginContext, companyId: string, bin
 }
 
 function inferTitle(path: string, contents: string): string {
+  const frontmatterTitle = markdownMetadata(contents).title;
+  if (frontmatterTitle) return frontmatterTitle;
   const heading = contents.match(/^#\s+(.+)$/m)?.[1]?.trim();
   if (heading) return heading;
   const filename = path.split("/").pop()?.replace(/\.md$/i, "") ?? path;
   return filename.replace(/[-_]+/g, " ");
+}
+
+function markdownMetadata(contents: string): { title: string | null; description: string | null; tags: string[]; frontmatter: Record<string, unknown> } {
+  const block = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(contents)?.[1] ?? "";
+  const value = (key: string) => block.match(new RegExp(`^${key}:\\s*["']?(.+?)["']?\\s*$`, "mi"))?.[1]?.trim() ?? null;
+  const tags = [...block.matchAll(/^\s*-\s*([^\r\n]+)\s*$/gm)].map((match) => match[1]!.trim());
+  const title = value("title");
+  const description = value("description");
+  return {
+    title,
+    description,
+    tags,
+    frontmatter: {
+      ...(title ? { title } : {}),
+      ...(description ? { description } : {}),
+      ...(tags.length ? { tags } : {}),
+    },
+  };
 }
 
 function inferPageType(path: string): string | null {
@@ -1798,7 +1818,8 @@ async function upsertPageMetadata(ctx: PluginContext, input: {
   const pageId = randomUUID();
   const revisionId = randomUUID();
   const hash = contentHash(input.contents);
-  const title = inferTitle(input.path, input.contents);
+  const markdown = markdownMetadata(input.contents);
+  const title = markdown.title ?? inferTitle(input.path, input.contents);
   const pageType = inferPageType(input.path);
   const backlinks = extractWikiLinks(input.contents);
   const sourceRefs = Array.isArray(input.sourceRefs) ? input.sourceRefs : [];
@@ -1806,10 +1827,11 @@ async function upsertPageMetadata(ctx: PluginContext, input: {
   await ctx.db.execute(
     `INSERT INTO ${tableName(ctx.db.namespace, "wiki_pages")}
        (id, company_id, wiki_id, space_id, path, title, page_type, frontmatter, source_refs, backlinks, content_hash, current_revision_id)
-     VALUES ($1, $2, $3, $11, $4, $5, $6, '{}'::jsonb, $7::jsonb, $8::jsonb, $9, $10)
-     ON CONFLICT (company_id, wiki_id, space_id, path)
-     DO UPDATE SET title = EXCLUDED.title,
-                   page_type = EXCLUDED.page_type,
+      VALUES ($1, $2, $3, $12, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11)
+      ON CONFLICT (company_id, wiki_id, space_id, path)
+      DO UPDATE SET title = EXCLUDED.title,
+                    page_type = EXCLUDED.page_type,
+                    frontmatter = EXCLUDED.frontmatter,
                    source_refs = EXCLUDED.source_refs,
                    backlinks = EXCLUDED.backlinks,
                    content_hash = EXCLUDED.content_hash,
@@ -1819,14 +1841,15 @@ async function upsertPageMetadata(ctx: PluginContext, input: {
       pageId,
       input.companyId,
       input.wikiId,
-      input.path,
-      title,
-      pageType,
-      jsonParam(sourceRefs),
-      jsonParam(backlinks),
-      hash,
-      revisionId,
-      input.spaceId,
+       input.path,
+       title,
+       pageType,
+       jsonParam(markdown.frontmatter),
+       jsonParam(sourceRefs),
+       jsonParam(backlinks),
+       hash,
+       revisionId,
+       input.spaceId,
     ],
   );
 
@@ -4266,13 +4289,24 @@ export async function registerWikiTools(ctx: PluginContext) {
     const companyId = requireString(input.companyId, "companyId");
     const wikiId = normalizeWikiId(input.wikiId);
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
-    const rows = await ctx.db.query<{ path: string; title: string | null; page_type: string | null }>(
-      `SELECT path, title, page_type FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 ORDER BY path LIMIT 200`,
+    const rows = await ctx.db.query<{ path: string; title: string | null; page_type: string | null; frontmatter: unknown; content_hash: string | null; updated_at: string }>(
+      `SELECT path, title, page_type, frontmatter, content_hash, updated_at::text AS updated_at FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 ORDER BY path LIMIT 200`,
       [companyId, wikiId, space.id],
     );
     return {
       content: rows.length ? rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No pages indexed yet.",
-      data: { companyId, wikiId, spaceSlug: space.slug, pages: rows },
+      data: { companyId, wikiId, spaceSlug: space.slug, pages: rows.map((row) => {
+        const frontmatter = parseJsonObject(row.frontmatter);
+        return {
+          path: row.path,
+          title: row.title,
+          pageType: row.page_type,
+          description: stringField(frontmatter.description),
+          tags: stringArray(frontmatter.tags),
+          contentHash: row.content_hash,
+          updatedAt: row.updated_at,
+        };
+      }) },
     };
   });
 }
@@ -4296,6 +4330,8 @@ export type WikiPageRow = {
   sourceCount: number;
   contentHash: string | null;
   updatedAt: string;
+  description?: string | null;
+  tags?: string[];
 };
 
 export type WikiSourceRow = {
@@ -4351,11 +4387,12 @@ export async function listPages(ctx: PluginContext, input: {
     title: string | null;
     page_type: string | null;
     backlinks: unknown;
-    source_refs: unknown;
+     source_refs: unknown;
+     frontmatter: unknown;
     content_hash: string | null;
     updated_at: string;
   }>(
-    `SELECT path, title, page_type, backlinks, source_refs, content_hash, updated_at::text AS updated_at
+    `SELECT path, title, page_type, backlinks, source_refs, frontmatter, content_hash, updated_at::text AS updated_at
        FROM ${tableName(ctx.db.namespace, "wiki_pages")}
       WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3${pageFilter}
       ORDER BY path
@@ -4371,6 +4408,8 @@ export async function listPages(ctx: PluginContext, input: {
     sourceCount: Array.isArray(row.source_refs) ? row.source_refs.length : 0,
     contentHash: row.content_hash,
     updatedAt: row.updated_at,
+    description: stringField(parseJsonObject(row.frontmatter).description),
+    tags: stringArray(parseJsonObject(row.frontmatter).tags),
   }));
   let pagesWithLocalFiles = pages;
   if (!input.pageType) {

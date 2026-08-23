@@ -10,8 +10,6 @@ const removedNames = [
   "paperclipInboxLite",
   "paperclipGetComment",
   "paperclipListIssueApprovals",
-  "paperclipListDocuments",
-  "paperclipGetDocument",
   "paperclipListDocumentRevisions",
   "paperclipGetGoal",
   "paperclipListApprovals",
@@ -42,11 +40,15 @@ const allTools = [
   inputSchema: { type: "object", properties: { value: { type: "string" } } },
 }));
 
-test("public catalog exposes exactly the allowlisted tools in stable order", () => {
+test("public catalog exposes the allowlisted tools in stable order without a magic count", () => {
   const catalog = filterChatGptPublicTools(allTools);
-  assert.equal(catalog.length, 20);
   assert.deepEqual(catalog.map((tool) => tool.name), CHATGPT_PUBLIC_TOOL_NAMES);
+  assert.ok(catalog.length > 0);
   assert.ok(removedNames.every((name) => !catalog.some((tool) => tool.name === name)));
+  assert.ok(!catalog.some((tool) => tool.name === "paperclipApiRequest"));
+  for (const required of ["paperclipUpdateDocument", "paperclipWikiProposeChange", "paperclipWikiApplyChange"]) {
+    assert.ok(catalog.some((tool) => tool.name === required));
+  }
   for (const compat of ["paperclipListSkills", "paperclipGetSkill", "paperclipUseSkill"]) {
     assert.ok(catalog.some((tool) => tool.name === compat));
   }
@@ -84,5 +86,6 @@ test("similar tool descriptions have distinct primary intent", () => {
   assert.match(descriptions.paperclipCreateIssue, /^Create /);
   assert.match(descriptions.paperclipUpdateIssue, /^Update /);
   assert.match(descriptions.paperclipAddComment, /^Add /);
-  assert.match(descriptions.paperclipApiRequest, /^Call an existing/);
+  assert.match(descriptions.paperclipWikiProposeChange, /^Prepare a non-mutating/);
+  assert.match(descriptions.paperclipWikiApplyChange, /^Apply a previously prepared/);
 });

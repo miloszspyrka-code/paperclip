@@ -1,15 +1,18 @@
 import http from "node:http";
 import https from "node:https";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   CHATGPT_PUBLIC_TOOL_NAME_SET,
+  CHATGPT_PUBLIC_TOOL_DESCRIPTIONS,
+  PUBLIC_GATEWAY_TOOLS,
   filterChatGptPublicTools,
 } from "./scripts/mcp-public-tool-catalog.mjs";
 import {
   enforceWriteGuard,
+  SKILL_REGISTRY,
 } from "./scripts/paperclip-skill-contract.mjs";
 import { RefreshTokenStore } from "./mcp-public-gateway/refresh-token-store.mjs";
 import { createSkillOperationRouter } from "./mcp-public-gateway/skill-operation-router.mjs";
@@ -28,6 +31,7 @@ const ISSUER = (process.env.MCP_PUBLIC_ISSUER || "https://mcp.kompaszbiorek.pl")
 const KEY_FILE = process.env.MCP_PUBLIC_KEY_FILE || join(__dirname, "secrets", "mcp-public.key");
 const CLIENTS_FILE = join(__dirname, "data", "mcp-public-clients.json");
 const REFRESH_TOKENS_FILE = process.env.MCP_PUBLIC_REFRESH_TOKENS_FILE || join(__dirname, "data", "mcp-public-refresh-tokens.json");
+const AUDIT_FILE = process.env.MCP_PUBLIC_AUDIT_FILE || join(__dirname, "data", "mcp-public-audit.jsonl");
 const USER = process.env.MCP_PUBLIC_USER || "milos";
 const PASS = process.env.MCP_PUBLIC_PASS || "";
 const TARGETS_JSON = process.env.MCP_PUBLIC_TARGETS || "{}";
@@ -44,7 +48,127 @@ const OPERATOR_SKILL_NAMES = [
   "paperclip-opencode-health",
   "paperclip-deleguj-coo",
   "paperclip-wdroz-runtime",
+  "wiki-query",
+  "wiki-propose-change",
+  "wiki-apply-change",
 ];
+const WIKI_PROPOSALS = new Map();
+const PUBLIC_GATEWAY_TOOL_NAMES = new Set([
+  ...PUBLIC_GATEWAY_TOOLS.map((tool) => tool.name),
+  "paperclipListDocuments",
+  "paperclipGetDocument",
+]);
+
+function configuredPrincipals() {
+  try {
+    const parsed = JSON.parse(process.env.MCP_PUBLIC_PRINCIPALS || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+const PRINCIPALS = configuredPrincipals();
+
+function principalForLogin(login) {
+  const configured = PRINCIPALS[login];
+  if (!configured || typeof configured !== "object") {
+    // Existing installations keep their legacy operator tools, but no document
+    // or Wiki company scope is granted until an explicit identity mapping exists.
+    return { sub: `external:${login}`, companyIds: [] };
+  }
+  return {
+    sub: typeof configured.sub === "string" && configured.sub.trim() ? configured.sub.trim() : `external:${login}`,
+    companyIds: Array.isArray(configured.companyIds) ? configured.companyIds.filter((id) => typeof id === "string") : [],
+  };
+}
+
+function scopes(payload) {
+  return new Set(String(payload?.scope || "").split(/\s+/).filter(Boolean));
+}
+
+function hasScope(payload, scope) {
+  return scopes(payload).has(scope);
+}
+
+function requiredScopeForTool(name) {
+  if (["paperclipListDocuments", "paperclipGetDocument", "paperclipGetDocumentHistory", "paperclipGetDocumentRevision"].includes(name)) return "paperclip:documents:read";
+  if (name === "paperclipUpdateDocument") return "paperclip:documents:write";
+  if (["paperclipWikiList", "paperclipWikiSearch", "paperclipWikiGetPage", "paperclipWikiGetMetadata"].includes(name)) return "paperclip:wiki:read";
+  if (["paperclipWikiProposeChange", "paperclipWikiApplyChange"].includes(name)) return "paperclip:wiki:write";
+  if (PUBLIC_WRITE_TOOL_NAMES.has(name)) return "mcp:write";
+  return "mcp:read";
+}
+
+function selectCompany(payload, requested) {
+  const companyIds = Array.isArray(payload?.company_ids) ? payload.company_ids : [];
+  const companyId = typeof requested === "string" && requested.trim() ? requested.trim() : companyIds.length === 1 ? companyIds[0] : null;
+  if (!companyId || !companyIds.includes(companyId)) {
+    const error = new Error("The authenticated principal is not granted access to this company");
+    error.code = "COMPANY_ACCESS_DENIED";
+    throw error;
+  }
+  return companyId;
+}
+
+function rpcToolResult(data) {
+  return { result: { content: [{ type: "text", text: JSON.stringify(data) }], structuredContent: data } };
+}
+
+function rpcError(code, message, data = {}) {
+  return { error: { code, message, data } };
+}
+
+function auditWrite(input) {
+  const entry = { timestamp: new Date().toISOString(), ...input };
+  try {
+    mkdirSync(dirname(AUDIT_FILE), { recursive: true, mode: 0o700 });
+    appendFileSync(AUDIT_FILE, `${JSON.stringify(entry)}\n`, { encoding: "utf8", mode: 0o600 });
+  } catch (error) {
+    log("audit write failed", { error: String(error?.message || error) });
+  }
+}
+
+function decodePath(value) {
+  let decoded = String(value || "").trim();
+  for (let index = 0; index < 3; index += 1) {
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      throw new Error("Invalid encoded Wiki page path");
+    }
+  }
+  return decoded;
+}
+
+function assertPublicWikiPage(value) {
+  const page = decodePath(value).replaceAll("\\", "/").replace(/^\/+/, "");
+  const segments = page.split("/");
+  if (!page || !page.endsWith(".md") || segments.some((segment) => !segment || segment === "." || segment === "..")) {
+    throw new Error("WIKI_PATH_FORBIDDEN");
+  }
+  const lower = page.toLowerCase();
+  if (!lower.startsWith("wiki/") || lower.startsWith("raw/") || lower.includes("/.git/") || lower.startsWith(".git/") || lower.includes(".env") || /(^|\/)(agents\.md|templates?)(\/|$)/i.test(page)) {
+    throw new Error("WIKI_PATH_FORBIDDEN");
+  }
+  return page;
+}
+
+function hash(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function metadataFromMarkdown(path, text, fallback = {}) {
+  const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(text)?.[1] || "";
+  const field = (name) => new RegExp(`^${name}:\\s*[\\"']?(.+?)[\\"']?\\s*$`, "mi").exec(frontmatter)?.[1]?.trim() || null;
+  const heading = /^#\s+(.+)$/m.exec(text)?.[1]?.trim() || null;
+  const lead = text.split(/\r?\n/).map((line) => line.trim()).find((line) => line && !line.startsWith("#") && !line.startsWith("---") && !/^(title|description|tags):/i.test(line)) || null;
+  const title = field("title") || fallback.title || heading || path.split("/").pop().replace(/\.md$/i, "").replace(/[-_]+/g, " ");
+  const description = field("description") || fallback.description || lead || `Wiki page: ${title}.`;
+  const tags = [...frontmatter.matchAll(/^\s*-\s*([^\r\n]+)\s*$/gm)].map((match) => match[1].trim());
+  return { title, description, tags };
+}
 
 function loadOrCreateKey() {
   if (existsSync(KEY_FILE)) return readFileSync(KEY_FILE, "utf8").trim();
@@ -194,12 +318,34 @@ function loadOperatorSkills() {
 
 const OPERATOR_SKILLS = loadOperatorSkills();
 
+function publicSkillMetadata(skill) {
+  const registry = SKILL_REGISTRY[skill.name];
+  const mode = skill.frontmatter.mode || (registry?.modes?.length === 1 ? registry.modes[0] : registry?.modes?.includes("PLAN") ? "PLAN" : "DIAGNOSE");
+  const writeScope = skill.frontmatter.writeScope || (skill.name.startsWith("wiki-") ? "wiki-pages" : null);
+  return {
+    uri: skill.uri,
+    name: skill.name,
+    version: skill.frontmatter.version || registry?.version || "1.0.0",
+    description: skill.frontmatter.description || "",
+    mode,
+    readOnly: mode !== "EXECUTE",
+    requiredTools: skill.frontmatter.requiredTools ? skill.frontmatter.requiredTools.split(",").map((entry) => entry.trim()).filter(Boolean) : [],
+    capabilities: skill.frontmatter.capabilities ? skill.frontmatter.capabilities.split(",").map((entry) => entry.trim()).filter(Boolean) : [],
+    ...(writeScope ? { writeScope } : {}),
+    ...(skill.frontmatter.requiresExpectedHash === "true" ? { requiresExpectedHash: true } : {}),
+    frontmatter: skill.frontmatter,
+    resources: skill.resources,
+  };
+}
+
 // Mutating public tools subject to the server-side skill write guard.
 const PUBLIC_WRITE_TOOL_NAMES = new Set([
   "paperclipCreateIssue",
   "paperclipUpdateIssue",
   "paperclipAddComment",
   "paperclipControlIssueWorkspaceServices",
+  "paperclipUpdateDocument",
+  "paperclipWikiApplyChange",
 ]);
 
 // ---------- OAuth model ----------
@@ -234,12 +380,13 @@ function redirectAllowed(redirectUri) {
   return false;
 }
 
-function issueAccessToken(app, clientId, scope) {
+function issueAccessToken(app, clientId, scope, principal) {
   const resource = resourceUrlFor(app);
   const now = nowMs();
   return sign({
     iss: ISSUER,
-    sub: "operator",
+    sub: principal.sub,
+    company_ids: principal.companyIds,
     aud: resource,
     client_id: clientId,
     scope: scope || "mcp:read mcp:write",
@@ -346,7 +493,7 @@ const fail = (error, description) => {
         }
         failedLogins.delete(clientIp(req));
         const sessionId = randToken(16);
-        sessions.set(sessionId, { createdAt: nowMs() });
+        sessions.set(sessionId, { createdAt: nowMs(), principal: principalForLogin(user) });
         const params = new URLSearchParams({ iss: ISSUER });
         if (state) params.set("state", state);
         res.writeHead(302, {
@@ -360,7 +507,7 @@ const fail = (error, description) => {
       }
       // consent
       const code = randToken(24);
-      codes.issue(code, { clientId, redirectUri, state, scope, resource, codeChallenge, app });
+      codes.issue(code, { clientId, redirectUri, state, scope, resource, codeChallenge, app, principal: sessions.get(cookie).principal });
       const params = new URLSearchParams({ code, iss: ISSUER });
       if (state) params.set("state", state);
       log("authorize ok", { client_id: clientId, app, scope });
@@ -416,9 +563,10 @@ const fail = (error, description) => {
           tfail("resource");
           return sendJson(res, 400, { error: "invalid_grant", error_description: "resource mismatch" });
         }
-        const access = issueAccessToken(app, clientId, codeObj.scope);
+        const principal = codeObj.principal || principalForLogin(USER);
+        const access = issueAccessToken(app, clientId, codeObj.scope, principal);
         const refresh = randToken(40);
-        refreshTokens.issue(refresh, { clientId, app, scope: codeObj.scope });
+        refreshTokens.issue(refresh, { clientId, app, scope: codeObj.scope, principal });
         log("token issued", { client_id: clientId, app, scope: codeObj.scope });
         return sendJson(res, 200, {
           access_token: access,
@@ -435,7 +583,7 @@ const fail = (error, description) => {
         const resource = form.get("resource") || resourceUrlFor(r.app);
         const app = resourceName(resource);
         if (!app || app !== r.app) return sendJson(res, 400, { error: "invalid_grant", error_description: "resource mismatch" });
-        const access = issueAccessToken(app, clientId, r.scope);
+        const access = issueAccessToken(app, clientId, r.scope, r.principal || principalForLogin(USER));
         const next = randToken(40);
         refreshTokens.rotate(refresh, next);
         return sendJson(res, 200, {
@@ -630,8 +778,261 @@ async function aggregatedTools(ps) {
     }
   }
   const filtered = filterChatGptPublicTools(out);
+  for (const tool of PUBLIC_GATEWAY_TOOLS) {
+    if (!filtered.some((entry) => entry.name === tool.name)) filtered.push(tool);
+  }
   for (const t of gatewaySkillTools()) if (!filtered.some((x) => x.name === t.name)) filtered.push(t);
   return filtered;
+}
+
+async function callUpstreamTool(ps, name, args) {
+  const rec = await ensureUpSession(ps, DEFAULT_APP);
+  const response = await upstreamCall(DEFAULT_APP, rec.upId, {
+    jsonrpc: "2.0",
+    id: randToken(8),
+    method: "tools/call",
+    params: { name, arguments: args },
+  });
+  if (response.json.error) {
+    const error = new Error(response.json.error.message || "Upstream tool failed");
+    error.upstream = response.json.error;
+    throw error;
+  }
+  return response.json.result;
+}
+
+function toolData(result) {
+  if (result?.structuredContent && typeof result.structuredContent === "object") return result.structuredContent;
+  if (result?.data && typeof result.data === "object") return result.data;
+  const text = Array.isArray(result?.content)
+    ? result.content.filter((entry) => entry?.type === "text").map((entry) => entry.text).join("\n")
+    : "";
+  try { return JSON.parse(text); } catch { return { text }; }
+}
+
+function upstreamErrorCode(error) {
+  const message = String(error?.message || error);
+  if (/expected hash|Refusing to overwrite/i.test(message)) return "WIKI_HASH_CONFLICT";
+  if (/currentRevisionId|updated by someone else|baseRevisionId/i.test(message)) return "DOCUMENT_REVISION_CONFLICT";
+  return null;
+}
+
+function wikiResource(page, companyId, spaceSlug) {
+  const path = assertPublicWikiPage(page.path || page);
+  const title = page.title || path.split("/").pop().replace(/\.md$/i, "").replace(/[-_]+/g, " ");
+  const description = page.description || `Wiki page: ${title}.`;
+  const uri = `paperclip://companies/${encodeURIComponent(companyId)}/wiki/pages/${encodeURIComponent(path)}`;
+  return {
+    uri,
+    name: title,
+    description,
+    mimeType: "text/markdown",
+    _meta: {
+      resourceType: "wiki-page",
+      readOnly: false,
+      revision: page.revisionId || null,
+      hash: page.hash || page.contentHash || null,
+      tags: Array.isArray(page.tags) ? page.tags : [],
+      updatedAt: page.updatedAt || null,
+      capabilities: ["read", "propose-change", "apply-change"],
+      recommendedSkills: { read: "wiki-query", edit: "wiki-propose-change", apply: "wiki-apply-change" },
+      companyId,
+      spaceSlug,
+      page: path,
+    },
+  };
+}
+
+async function publicWikiCall(ps, payload, name, args, write = false) {
+  const companyId = selectCompany(payload, args.companyId);
+  const page = args.page ? assertPublicWikiPage(args.page) : null;
+  const parameters = {
+    companyId,
+    wikiId: "default",
+    ...(args.spaceSlug ? { spaceSlug: String(args.spaceSlug) } : {}),
+    ...(page ? { path: page } : {}),
+  };
+  if (name === "wiki_search") {
+    parameters.query = String(args.query || "");
+    parameters.limit = args.limit;
+  }
+  if (name === "wiki_propose_patch" || name === "wiki_write_page") {
+    parameters.contents = String(args.content || "");
+    parameters.expectedHash = String(args.expectedHash || "");
+    parameters.summary = typeof args.summary === "string" ? args.summary : "Public MCP Wiki update";
+  }
+  const result = await callUpstreamTool(ps, name, parameters);
+  return { companyId, page, spaceSlug: parameters.spaceSlug || "default", data: toolData(result), result, write };
+}
+
+async function handlePublicGatewayTool({ ps, payload, name, args }) {
+  try {
+    if (["paperclipListDocuments", "paperclipGetDocument", "paperclipGetDocumentHistory", "paperclipGetDocumentRevision", "paperclipUpdateDocument"].includes(name)) {
+      const issue = toolData(await callUpstreamTool(ps, "paperclipGetIssue", { issueId: args.issueId }));
+      selectCompany(payload, issue.companyId);
+    }
+    if (name === "paperclipListDocuments") {
+      return rpcToolResult(toolData(await callUpstreamTool(ps, "paperclipListDocuments", { issueId: args.issueId })));
+    }
+    if (name === "paperclipGetDocument") {
+      return rpcToolResult(toolData(await callUpstreamTool(ps, "paperclipGetDocument", { issueId: args.issueId, key: args.key })));
+    }
+    if (name === "paperclipGetDocumentHistory") {
+      const result = await callUpstreamTool(ps, "paperclipListDocumentRevisions", { issueId: args.issueId, key: args.key });
+      return rpcToolResult(toolData(result));
+    }
+    if (name === "paperclipGetDocumentRevision") {
+      const history = toolData(await callUpstreamTool(ps, "paperclipListDocumentRevisions", { issueId: args.issueId, key: args.key }));
+      const revisions = Array.isArray(history) ? history : history.revisions || [];
+      const revision = revisions.find((entry) => entry?.id === args.revisionId) || null;
+      return revision ? rpcToolResult(revision) : rpcError(-32002, "Document revision not found");
+    }
+    if (name === "paperclipUpdateDocument") {
+      const result = await callUpstreamTool(ps, "paperclipUpsertIssueDocument", {
+        issueId: args.issueId,
+        key: args.key,
+        body: args.content,
+        baseRevisionId: args.baseRevisionId,
+        format: "markdown",
+        ...(args.title === undefined ? {} : { title: args.title }),
+        ...(args.changeSummary === undefined ? {} : { changeSummary: args.changeSummary }),
+      });
+      const data = toolData(result);
+      auditWrite({ principal: payload.sub, companyId: data.companyId || null, operation: "document.update", resource: `${args.issueId}/${args.key}`, beforeRevision: args.baseRevisionId, afterRevision: data.latestRevisionId || null, proposalId: null, result: "success" });
+      return rpcToolResult(data);
+    }
+    if (name === "paperclipWikiList") {
+      const call = await publicWikiCall(ps, payload, "wiki_list_pages", args);
+      const pages = Array.isArray(call.data.pages) ? call.data.pages : [];
+      return rpcToolResult({ pages: pages.filter((page) => {
+        try { assertPublicWikiPage(page.path); return true; } catch { return false; }
+      }).map((page) => wikiResource(page, call.companyId, call.spaceSlug)) });
+    }
+    if (name === "paperclipWikiSearch") {
+      const call = await publicWikiCall(ps, payload, "wiki_search", args);
+      const results = Array.isArray(call.data.results) ? call.data.results : [];
+      return rpcToolResult({ results: results.filter((entry) => entry?.kind !== "source").map((entry) => {
+        const page = assertPublicWikiPage(entry.path);
+        return { slug: page.replace(/^wiki\//, "").replace(/\.md$/i, ""), title: entry.title || page, description: entry.description || `Wiki page: ${entry.title || page}.`, score: entry.score ?? 1, hash: entry.hash ?? null, tags: entry.tags || [] };
+      }) });
+    }
+    if (name === "paperclipWikiGetPage" || name === "paperclipWikiGetMetadata") {
+      const call = await publicWikiCall(ps, payload, "wiki_read_page", args);
+      const text = typeof call.data.contents === "string" ? call.data.contents : typeof call.data.text === "string" ? call.data.text : "";
+      const meta = metadataFromMarkdown(call.page, text, call.data);
+      const resource = wikiResource({ ...call.data, ...meta, path: call.page, hash: call.data.hash || hash(text) }, call.companyId, call.spaceSlug);
+      return rpcToolResult(name === "paperclipWikiGetMetadata" ? resource : { ...resource._meta, page: call.page, title: meta.title, description: meta.description, content: text });
+    }
+    if (name === "paperclipWikiProposeChange") {
+      const current = await publicWikiCall(ps, payload, "wiki_read_page", args);
+      const text = typeof current.data.contents === "string" ? current.data.contents : typeof current.data.text === "string" ? current.data.text : "";
+      const currentHash = current.data.hash || hash(text);
+      if (args.expectedHash !== currentHash) {
+        return rpcError(-32009, "WIKI_HASH_CONFLICT", { code: "WIKI_HASH_CONFLICT", page: current.page, suppliedHash: args.expectedHash, currentHash });
+      }
+      const proposalId = `wiki-${randToken(16)}`;
+      const proposedHash = hash(String(args.content));
+      WIKI_PROPOSALS.set(proposalId, { proposalId, principal: payload.sub, companyId: current.companyId, spaceSlug: current.spaceSlug, page: current.page, baseHash: currentHash, content: String(args.content), predictedHash: proposedHash, summary: args.summary || null, createdAt: nowMs(), applied: null });
+      return rpcToolResult({ proposalId, page: current.page, baseHash: currentHash, resultingHash: proposedHash, diff: `--- ${current.page}\n+++ ${current.page}\n@@ full replacement @@\n-${text}\n+${String(args.content)}`, changed: text !== String(args.content), warnings: [] });
+    }
+    if (name === "paperclipWikiApplyChange") {
+      const proposal = WIKI_PROPOSALS.get(String(args.proposalId));
+      if (!proposal || proposal.principal !== payload.sub) return rpcError(-32002, "Wiki proposal not found");
+      if (proposal.applied) return rpcToolResult(proposal.applied);
+      if (args.expectedHash !== proposal.baseHash) return rpcError(-32009, "WIKI_HASH_CONFLICT", { code: "WIKI_HASH_CONFLICT", page: proposal.page, suppliedHash: args.expectedHash, currentHash: proposal.baseHash });
+      const current = await publicWikiCall(ps, payload, "wiki_read_page", { companyId: proposal.companyId, spaceSlug: proposal.spaceSlug, page: proposal.page });
+      const text = typeof current.data.contents === "string" ? current.data.contents : typeof current.data.text === "string" ? current.data.text : "";
+      const currentHash = current.data.hash || hash(text);
+      if (currentHash !== proposal.baseHash) return rpcError(-32009, "WIKI_HASH_CONFLICT", { code: "WIKI_HASH_CONFLICT", page: proposal.page, suppliedHash: proposal.baseHash, currentHash });
+      const written = await publicWikiCall(ps, payload, "wiki_write_page", { companyId: proposal.companyId, spaceSlug: proposal.spaceSlug, page: proposal.page, expectedHash: proposal.baseHash, content: proposal.content, summary: proposal.summary }, true);
+      const output = { previousHash: proposal.baseHash, newHash: written.data.hash || proposal.predictedHash, changed: proposal.content !== text, page: proposal.page };
+      proposal.applied = output;
+      auditWrite({ principal: payload.sub, companyId: proposal.companyId, operation: "wiki.apply", resource: proposal.page, beforeHash: proposal.baseHash, afterHash: output.newHash, proposalId: proposal.proposalId, result: "success" });
+      return rpcToolResult(output);
+    }
+    return null;
+  } catch (error) {
+    const code = upstreamErrorCode(error);
+    if (code === "WIKI_HASH_CONFLICT") return rpcError(-32009, code, { code });
+    if (code === "DOCUMENT_REVISION_CONFLICT") return rpcError(-32010, code, { code, suppliedRevision: args.baseRevisionId, documentId: args.key });
+    if (error?.code === "COMPANY_ACCESS_DENIED") return rpcError(-32003, "COMPANY_ACCESS_DENIED", { code: "COMPANY_ACCESS_DENIED" });
+    if (String(error?.message || error).includes("WIKI_PATH_FORBIDDEN")) return rpcError(-32602, "WIKI_PATH_FORBIDDEN", { code: "WIKI_PATH_FORBIDDEN" });
+    return rpcError(-32603, String(error?.message || error));
+  }
+}
+
+async function listPublicResources(ps, payload) {
+  const resources = [];
+  const companyIds = Array.isArray(payload.company_ids) ? payload.company_ids : [];
+  if (hasScope(payload, "paperclip:wiki:read")) {
+    for (const companyId of companyIds) {
+      try {
+        const result = toolData(await callUpstreamTool(ps, "wiki_list_pages", { companyId, wikiId: "default" }));
+        for (const page of result.pages || []) {
+          try { resources.push(wikiResource(page, companyId, "default")); } catch {}
+        }
+      } catch (error) {
+        log("wiki resource discovery unavailable", { companyId, error: String(error?.message || error) });
+      }
+    }
+  }
+  if (hasScope(payload, "paperclip:documents:read")) {
+    for (const companyId of companyIds) {
+      try {
+        const issues = toolData(await callUpstreamTool(ps, "paperclipListIssues", { companyId }));
+        for (const issue of Array.isArray(issues) ? issues : issues.issues || []) {
+          const issueId = issue?.id;
+          if (!issueId) continue;
+          const documents = toolData(await callUpstreamTool(ps, "paperclipListDocuments", { issueId }));
+          for (const document of Array.isArray(documents) ? documents : documents.documents || []) {
+            const key = document?.key;
+            if (!key) continue;
+            resources.push({
+              uri: `paperclip://companies/${encodeURIComponent(companyId)}/documents/${encodeURIComponent(issueId)}/${encodeURIComponent(key)}`,
+              name: document.title || key,
+              description: `Issue document ${key}${document.title ? `: ${document.title}` : ""}.`,
+              mimeType: "text/markdown",
+              _meta: {
+                resourceType: "issue-document",
+                readOnly: false,
+                revision: document.latestRevisionId || null,
+                updatedAt: document.updatedAt || null,
+                capabilities: ["read", "history", "update"],
+                recommendedSkills: { read: "wiki-query", edit: "wiki-propose-change", apply: "wiki-apply-change" },
+                companyId,
+                issueId,
+                key,
+              },
+            });
+          }
+        }
+      } catch (error) {
+        log("document resource discovery unavailable", { companyId, error: String(error?.message || error) });
+      }
+    }
+  }
+  return resources;
+}
+
+async function readPublicResource(ps, payload, uri) {
+  const documentMatch = /^paperclip:\/\/companies\/([^/]+)\/documents\/([^/]+)\/([^/]+)$/.exec(uri);
+  if (documentMatch) {
+    if (!hasScope(payload, "paperclip:documents:read")) return rpcError(-32003, "INSUFFICIENT_SCOPE", { code: "INSUFFICIENT_SCOPE", requiredScope: "paperclip:documents:read" });
+    const companyId = selectCompany(payload, decodeURIComponent(documentMatch[1]));
+    const issueId = decodeURIComponent(documentMatch[2]);
+    const key = decodeURIComponent(documentMatch[3]);
+    const data = toolData(await callUpstreamTool(ps, "paperclipGetDocument", { issueId, key }));
+    return { result: { contents: [{ uri, mimeType: "text/markdown", text: data.body || data.content || "", _meta: { companyId, revision: data.latestRevisionId || null } }] } };
+  }
+  const wikiMatch = /^paperclip:\/\/companies\/([^/]+)\/wiki\/pages\/([^/]+)$/.exec(uri);
+  if (wikiMatch) {
+    if (!hasScope(payload, "paperclip:wiki:read")) return rpcError(-32003, "INSUFFICIENT_SCOPE", { code: "INSUFFICIENT_SCOPE", requiredScope: "paperclip:wiki:read" });
+    const companyId = selectCompany(payload, decodeURIComponent(wikiMatch[1]));
+    const page = assertPublicWikiPage(decodeURIComponent(wikiMatch[2]));
+    const data = toolData(await callUpstreamTool(ps, "wiki_read_page", { companyId, wikiId: "default", path: page }));
+    return { result: { contents: [{ uri, mimeType: "text/markdown", text: data.contents || data.text || "", _meta: { companyId, hash: data.hash || null, page } }] } };
+  }
+  return null;
 }
 
 async function handleAggregate(req, res) {
@@ -676,6 +1077,7 @@ async function handleAggregate(req, res) {
         protocolVersion: ver,
         capabilities: {
           tools: { listChanged: false },
+          resources: { listChanged: false },
           extensions: { "io.modelcontextprotocol/skills": {} },
         },
         serverInfo: { name: "kompas-mcp", version: "1.3.0-skill-hardening" },
@@ -703,8 +1105,28 @@ async function handleAggregate(req, res) {
 
   if (method === "tools/call") {
     const { app, name } = routeToolName(msg.params?.name || "");
+    const requiredScope = requiredScopeForTool(name);
+    if (!hasScope(payload, requiredScope)) {
+      return sendJson(res, 403, { jsonrpc: "2.0", id, error: { code: -32003, message: "INSUFFICIENT_SCOPE", data: { code: "INSUFFICIENT_SCOPE", requiredScope } } });
+    }
     const skillResponse = await skillOperationRouter.handle({ app, name, args: msg.params?.arguments, session: ps, payload });
     if (skillResponse) return sendJson(res, skillResponse.error ? 400 : 200, { jsonrpc: "2.0", id, ...skillResponse });
+    if (app === DEFAULT_APP && PUBLIC_GATEWAY_TOOL_NAMES.has(name)) {
+      if (PUBLIC_WRITE_TOOL_NAMES.has(name) && ps.operation) {
+        const verdict = enforceWriteGuard({
+          envelope: ps.operation.envelope,
+          writesUsed: ps.operation.writesUsed,
+          toolName: name,
+          arguments: msg.params?.arguments || {},
+        });
+        if (!verdict.allowed) {
+          return sendJson(res, 403, { jsonrpc: "2.0", id, error: { code: -32003, message: verdict.code, data: verdict } });
+        }
+        ps.operation.writesUsed += 1;
+      }
+      const response = await handlePublicGatewayTool({ ps, payload, name, args: msg.params?.arguments || {} });
+      return sendJson(res, response.error ? 400 : 200, { jsonrpc: "2.0", id, ...response });
+    }
     if (app === DEFAULT_APP && !CHATGPT_PUBLIC_TOOL_NAME_SET.has(name)) {
       return sendJson(res, 404, { jsonrpc: "2.0", id, error: { code: -32601, message: "Tool is not available in the public catalog" } });
     }
@@ -745,8 +1167,11 @@ async function handleAggregate(req, res) {
   }
 
   if (method === "skills/list") {
+    if (!hasScope(payload, "mcp:read")) {
+      return sendJson(res, 403, { jsonrpc: "2.0", id, error: { code: -32003, message: "INSUFFICIENT_SCOPE", data: { code: "INSUFFICIENT_SCOPE", requiredScope: "mcp:read" } } });
+    }
     const cursor = String(msg.params?.cursor || "");
-    const skills = cursor ? [] : OPERATOR_SKILLS.map(({ uri, frontmatter, resources }) => ({ uri, frontmatter, resources }));
+    const skills = cursor ? [] : OPERATOR_SKILLS.map(publicSkillMetadata);
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ jsonrpc: "2.0", id, result: { skills } }));
   }
@@ -760,12 +1185,18 @@ async function handleAggregate(req, res) {
     return res.end(JSON.stringify({
       jsonrpc: "2.0",
       id,
-      result: { skill: { uri: skill.uri, frontmatter: skill.frontmatter, resources: skill.resources } },
+        result: { skill: publicSkillMetadata(skill) },
     }));
   }
 
   if (method === "resources/read") {
     const uri = String(msg.params?.uri || "");
+    try {
+      const publicResource = await readPublicResource(ps, payload, uri);
+      if (publicResource) return sendJson(res, publicResource.error ? 400 : 200, { jsonrpc: "2.0", id, ...publicResource });
+    } catch (error) {
+      return sendJson(res, 400, { jsonrpc: "2.0", id, ...rpcError(-32602, String(error?.message || error)) });
+    }
     const resource = OPERATOR_SKILLS.flatMap((skill) => skill.resources).find((entry) => entry.uri === uri);
     if (!resource) {
       return sendJson(res, 400, { jsonrpc: "2.0", id, error: { code: -32002, message: "Resource not found" } });
@@ -785,8 +1216,13 @@ async function handleAggregate(req, res) {
   }
 
   if (method === "resources/list") {
+    const resources = await listPublicResources(ps, payload);
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ jsonrpc: "2.0", id, result: { resources: [] } }));
+    return res.end(JSON.stringify({ jsonrpc: "2.0", id, result: { resources } }));
+  }
+  if (method === "resources/templates/list") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ jsonrpc: "2.0", id, result: { resourceTemplates: [] } }));
   }
   if (method === "prompts/list") {
     res.writeHead(200, { "Content-Type": "application/json" });

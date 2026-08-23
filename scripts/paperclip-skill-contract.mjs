@@ -57,6 +57,27 @@ export const SKILL_REGISTRY = {
     executeWritesPolicy: "preflight-lock-snapshot-rollback-required",
     aliases: ["/runtime", "/deploy-runtime"],
   },
+  "wiki-query": {
+    version: "1.0.0",
+    modes: ["DIAGNOSE", "PLAN"],
+    allowedWrites: 0,
+    executeWritesPolicy: "none-read-only-wiki-discovery",
+    aliases: [],
+  },
+  "wiki-propose-change": {
+    version: "1.0.0",
+    modes: ["PLAN"],
+    allowedWrites: 0,
+    executeWritesPolicy: "none-proposal-only",
+    aliases: [],
+  },
+  "wiki-apply-change": {
+    version: "1.0.0",
+    modes: ["EXECUTE"],
+    allowedWrites: MAX_ADMIN_WRITES_PER_OPERATION,
+    executeWritesPolicy: "expected-hash-required-wiki-page-only",
+    aliases: [],
+  },
 };
 
 // Mode resolution is deliberately conservative: only explicit markers or the

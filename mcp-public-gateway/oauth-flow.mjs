@@ -1,4 +1,12 @@
-export const OAUTH_SCOPES = ["mcp:read", "mcp:write", "offline_access"];
+export const OAUTH_SCOPES = [
+  "mcp:read",
+  "mcp:write",
+  "paperclip:documents:read",
+  "paperclip:documents:write",
+  "paperclip:wiki:read",
+  "paperclip:wiki:write",
+  "offline_access",
+];
 
 export function normalizeScope(scope) {
   const requested = String(scope || "mcp:read mcp:write").split(/\s+/).filter(Boolean);
