@@ -14,6 +14,14 @@
 
 Natural language only chooses an operation envelope. It never grants write authorization: `SKILL_REGISTRY`, `assertModeAllowed`, write budget, target scope, and `enforceWriteGuard` still apply. `paperclip-deleguj-coo` therefore rejects EXECUTE with `MODE_NOT_ALLOWED`.
 
+Requests are classified before an execution envelope is created: routine work is `RTB`, incremental Paperclip improvements are `ITB`, and architectural execution-engine or run-persistence rebuilds are `CTB`. `CTB` returns `CHANGE_CLASS=CTB` and `HANDOFF_TO=OpenCode CTB` without activating writes.
+
+## Run Observability
+
+`paperclipListIssueRuns` unifies persisted `heartbeat_runs` with the existing OpenCode CTB registry. Every known run returns its identity, kind, adapter/engine, status, timestamps, duration, and observability support. `paperclipGetRunEvents` returns only persisted ordered runtime events. `paperclipGetRunMetrics` derives tool metrics only from structured event payloads; a run without that telemetry returns explicit support status and `null` metric fields instead of invented values.
+
+Workspace validation failures are deterministic preflight blockers. They are not eligible for interaction-continuation recovery retries until state changes.
+
 ## OAuth Refresh Tokens
 
 Refresh tokens are stored in `data/mcp-public-refresh-tokens.json` by default. Override the private storage location with `MCP_PUBLIC_REFRESH_TOKENS_FILE`.
@@ -35,6 +43,8 @@ pnpm test:skill-fixtures
 pnpm test:public-tool-catalog
 pnpm test:mcp-public-gateway
 node --check mcp-public-gateway.mjs
+$env:PAPERCLIP_PUBLIC_RUN_SMOKE="1"; node scripts/smoke/paperclip-public-tool-catalog.mjs
+$env:PAPERCLIP_PUBLIC_SKILL_SMOKE="1"; node scripts/smoke/paperclip-public-tool-catalog.mjs
 ```
 
 `test:mcp-public-gateway` runs a local upstream MCP stub and verifies OAuth DCR, PKCE, refresh persistence across gateway process restart, rotation, revocation, expiry, metadata, initialize, tools/list, and JSON-RPC skill mode routing.

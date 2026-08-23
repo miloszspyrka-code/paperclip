@@ -6,6 +6,7 @@ import {
   SKILL_CONTRACT_VERSION,
   SKILL_REGISTRY,
   buildOperationEnvelope,
+  classifyChangeRequest,
   resolveMode,
 } from "../scripts/paperclip-skill-contract.mjs";
 
@@ -55,7 +56,7 @@ export function createSkillOperationRouter({ defaultApp, operatorSkills, readSki
   async function handle({ app, name, args, session, payload }) {
     if (app !== defaultApp || !["paperclipListSkills", "paperclipGetSkill", "paperclipUseSkill"].includes(name)) return null;
     if (name === "paperclipListSkills") {
-      return { result: { skills: operatorSkills.map((skill) => {
+      const skills = operatorSkills.map((skill) => {
         const registry = SKILL_REGISTRY[skill.name];
         const mode = skill.frontmatter.mode || (registry.modes.length === 1 ? registry.modes[0] : registry.modes.includes("PLAN") ? "PLAN" : "DIAGNOSE");
         return {
@@ -72,7 +73,8 @@ export function createSkillOperationRouter({ defaultApp, operatorSkills, readSki
           ...(skill.frontmatter.writeScope ? { writeScope: skill.frontmatter.writeScope } : {}),
           ...(skill.frontmatter.requiresExpectedHash === "true" ? { requiresExpectedHash: true } : {}),
         };
-      }) } };
+      });
+      return { result: { content: [{ type: "text", text: JSON.stringify({ skills }) }], structuredContent: { skills } } };
     }
     if (name === "paperclipGetSkill") {
       const skillName = String(args?.name || "").trim();
@@ -88,6 +90,16 @@ export function createSkillOperationRouter({ defaultApp, operatorSkills, readSki
     const skill = operatorSkills.find((entry) => entry.name === skillName);
     if (!skill) return { error: { code: -32602, message: `Unknown skill: ${skillName}` } };
     if (!request) return { error: { code: -32602, message: "request is required" } };
+    const classification = classifyChangeRequest(request);
+    if (classification.changeClass === "CTB") {
+      delete session.operation;
+      return {
+        result: {
+          content: [{ type: "text", text: "CHANGE_CLASS=CTB\nHANDOFF_TO=OpenCode CTB\nPaperclip does not execute architecture changes." }],
+          structuredContent: { CHANGE_CLASS: "CTB", HANDOFF_TO: "OpenCode CTB", RESULT: "HANDOFF", selectedSkill: skillName },
+        },
+      };
+    }
     const resolved = ALIASES[request.split(/\s+/)[0]] || skillName;
     const registry = SKILL_REGISTRY[resolved];
     const mode = resolveMode(request, { explicitMode: args?.mode });
@@ -127,6 +139,7 @@ export function createSkillOperationRouter({ defaultApp, operatorSkills, readSki
           upstreamToolCount,
           operationId: envelope.OPERATION_ID,
           aliases: registry.aliases,
+          CHANGE_CLASS: classification.changeClass,
           writeGuard: "server-enforced",
         },
       },

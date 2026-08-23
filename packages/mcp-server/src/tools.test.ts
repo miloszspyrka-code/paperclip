@@ -69,6 +69,19 @@ describe("paperclip MCP tools", () => {
     expect(response.content[0]?.text).toContain("issue-1");
   });
 
+  it("uses explicit read-only endpoints for heartbeat run observability", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse([]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await getTool("paperclipListHeartbeatRunsForIssue").execute({ issueId: "PAP-1135" });
+    await getTool("paperclipGetHeartbeatRun").execute({ runId: "33333333-3333-3333-3333-333333333333" });
+    await getTool("paperclipListHeartbeatRunEvents").execute({ runId: "33333333-3333-3333-3333-333333333333", afterSeq: 4, limit: 20 });
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("http://localhost:3100/api/issues/PAP-1135/runs");
+    expect(String(fetchMock.mock.calls[1]?.[0])).toBe("http://localhost:3100/api/heartbeat-runs/33333333-3333-3333-3333-333333333333");
+    expect(String(fetchMock.mock.calls[2]?.[0])).toBe("http://localhost:3100/api/heartbeat-runs/33333333-3333-3333-3333-333333333333/events?afterSeq=4&limit=20");
+  });
+
   it("uses default agent id for checkout requests", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ id: "PAP-1135", status: "in_progress" }),

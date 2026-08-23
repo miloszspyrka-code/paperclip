@@ -10,6 +10,15 @@ export const MAX_ADMIN_WRITES_PER_OPERATION = 3;
 export const MODES = ["DIAGNOSE", "PLAN", "EXECUTE"];
 export const RESULTS = ["PASS", "FAIL", "BLOCKED", "HANDOFF"];
 
+const CTB_INTENT_RE = /\b(przebuduj|zaprojektuj\s+od\s+nowa|zmien\w*\s+architektur\w*|now\w*\s+architektur\w*)\b.*\b(architektur\w*|execution\s+engine|run\s+persistence|opencode|paperclip)\b|\b(architecture|execution\s+engine|run\s+persistence)\b.*\b(rebuild|redesign|change)\b/i;
+
+export function classifyChangeRequest(request) {
+  const text = String(request || "").trim();
+  if (CTB_INTENT_RE.test(text)) return { changeClass: "CTB", handoffTo: "OpenCode CTB" };
+  if (/\b(napraw\w*|popraw\w*|usprawn\w*|incremental\w*)\b/i.test(text)) return { changeClass: "ITB", handoffTo: null };
+  return { changeClass: "RTB", handoffTo: null };
+}
+
 // PLAN intent markers. Explicit EXECUTE markers take precedence over planning.
 const PLAN_INTENT_RE =
   /\b(zaplanuj|przygotuj\s+plan|plan\s+only|utworz\s+plan|propose\s+a\s+plan)\b/i;

@@ -172,6 +172,46 @@ async function main() {
     }
   }
 
+  if (process.env.PAPERCLIP_PUBLIC_RUN_SMOKE === "1") {
+    // This existing read-only issue is used only to validate persisted Paperclip
+    // runs. The test never creates, wakes, or mutates an issue.
+    const issueId = process.env.PAPERCLIP_PUBLIC_RUN_ISSUE_ID || "c293e25d-6f8c-4636-a238-fb692afee9ef";
+    const runs = await rpc(30, "tools/call", { name: "paperclipListIssueRuns", arguments: { issueId } });
+    const runData = runs.body.result?.structuredContent;
+    const run = Array.isArray(runData?.runs) ? runData.runs.find((entry) => entry?.runKind === "heartbeat") : null;
+    if (runs.status !== 200 || !run?.runId) {
+      throw new Error(`Persisted Paperclip run correlation failed: ${JSON.stringify({ status: runs.status, data: runData, error: runs.body.error })}`);
+    }
+    const events = await rpc(31, "tools/call", { name: "paperclipGetRunEvents", arguments: { runId: run.runId } });
+    const metrics = await rpc(32, "tools/call", { name: "paperclipGetRunMetrics", arguments: { runId: run.runId } });
+    const eventData = events.body.result?.structuredContent;
+    const metricData = metrics.body.result?.structuredContent;
+    if (events.status !== 200 || metrics.status !== 200 || !Array.isArray(eventData?.events) || typeof metricData?.supportedObservability !== "boolean") {
+      throw new Error(`Persisted Paperclip observability failed: ${JSON.stringify({ events: events.body, metrics: metrics.body })}`);
+    }
+    output.paperclipRunObservability = {
+      issueId,
+      runId: run.runId,
+      runKind: run.runKind,
+      eventCount: eventData.events.length,
+      supportedObservability: metricData.supportedObservability,
+      reason: metricData.reason || null,
+    };
+  }
+
+  if (process.env.PAPERCLIP_PUBLIC_SKILL_SMOKE === "1") {
+    const listedSkills = await rpc(40, "tools/call", { name: "paperclipListSkills", arguments: {} });
+    const skillData = listedSkills.body.result?.structuredContent;
+    const skill = Array.isArray(skillData?.skills) ? skillData.skills[0] : null;
+    const fetched = await rpc(41, "tools/call", { name: "paperclipGetSkill", arguments: { name: skill?.name } });
+    const used = await rpc(42, "tools/call", { name: "paperclipUseSkill", arguments: { skill: skill?.name, request: "sprawdź bieżący stan" } });
+    const ctb = await rpc(43, "tools/call", { name: "paperclipUseSkill", arguments: { skill: skill?.name, request: "Przebuduj architekturę OpenCode/Paperclip execution engine." } });
+    if (!skill?.name || listedSkills.status !== 200 || fetched.status !== 200 || used.status !== 200 || ctb.body.result?.structuredContent?.HANDOFF_TO !== "OpenCode CTB") {
+      throw new Error(`Public skill contract failed: ${JSON.stringify({ listed: listedSkills.body, fetched: fetched.body, used: used.body, ctb: ctb.body })}`);
+    }
+    output.skills = { list: "PASS", get: "PASS", use: "PASS", ctb: ctb.body.result.structuredContent };
+  }
+
   console.log(JSON.stringify(output, null, 2));
 }
 

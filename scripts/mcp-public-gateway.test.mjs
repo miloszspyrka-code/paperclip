@@ -137,12 +137,18 @@ test("public gateway routes skill modes through JSON-RPC and persists rotated re
       res.writeHead(503, { "content-type": "application/json" });
       return res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32603, message: "Upstream unavailable" } }));
     }
-    const result = message.method === "tools/list" ? { tools: [] } : { protocolVersion: "2025-03-26", capabilities: {} };
+    let result;
+    if (message.method === "tools/list") result = { tools: [] };
+    else if (message.params?.name === "paperclipGetIssue") result = { structuredContent: { id: message.params.arguments.issueId, companyId: "11111111-1111-1111-1111-111111111111" } };
+    else if (message.params?.name === "paperclipListHeartbeatRunsForIssue") result = { structuredContent: [{ runId: "33333333-3333-3333-3333-333333333333", contextSnapshot: { issueId: "issue-1" }, adapterType: "opencode_local", status: "completed", startedAt: "2026-08-23T10:00:00.000Z", finishedAt: "2026-08-23T10:00:03.000Z" }] };
+    else if (message.params?.name === "paperclipGetHeartbeatRun") result = { structuredContent: { id: "33333333-3333-3333-3333-333333333333", companyId: "11111111-1111-1111-1111-111111111111", adapterType: "opencode_local", status: "completed", startedAt: "2026-08-23T10:00:00.000Z", finishedAt: "2026-08-23T10:00:03.000Z" } };
+    else if (message.params?.name === "paperclipListHeartbeatRunEvents") result = { structuredContent: [{ seq: 1, eventType: "tool", message: "persisted", payload: { toolName: "read", status: "success", durationMs: 12 }, createdAt: "2026-08-23T10:00:01.000Z" }, { seq: 2, eventType: "tool", message: "persisted", payload: { toolName: "test", status: "success" }, createdAt: "2026-08-23T10:00:02.000Z" }] };
+    else result = { protocolVersion: "2025-03-26", capabilities: {} };
     res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "upstream-session" });
     res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
   });
   const upstreamPort = await listen(upstream);
-  let gateway = await startGateway({ storage, upstreamPort });
+  let gateway = await startGateway({ storage, upstreamPort, principals: { "gateway-test-user": { sub: "test-user", companyIds: ["11111111-1111-1111-1111-111111111111"] } } });
   t.after(async () => {
     await stopGateway(gateway.process);
     await close(upstream);
@@ -167,6 +173,18 @@ test("public gateway routes skill modes through JSON-RPC and persists rotated re
   const listed = await rpc(gateway.base, token.access_token, 2, "tools/list", {}, session);
   assert.equal(listed.status, 200);
   assert.ok(listed.json.result.tools.some((tool) => tool.name === "paperclipUseSkill"));
+  const skills = await rpc(gateway.base, token.access_token, 23, "tools/call", { name: "paperclipListSkills", arguments: {} }, session);
+  assert.equal(skills.status, 200);
+  assert.ok(Array.isArray(skills.json.result.structuredContent.skills));
+  assert.equal(skills.json.result.content[0].type, "text");
+  const runs = await rpc(gateway.base, token.access_token, 24, "tools/call", { name: "paperclipListIssueRuns", arguments: { issueId: "issue-1" } }, session);
+  assert.equal(runs.status, 200);
+  assert.equal(runs.json.result.structuredContent.runs[0].runKind, "heartbeat");
+  const events = await rpc(gateway.base, token.access_token, 25, "tools/call", { name: "paperclipGetRunEvents", arguments: { runId: "33333333-3333-3333-3333-333333333333" } }, session);
+  assert.deepEqual(events.json.result.structuredContent.events.map((event) => event.seq), [1, 2]);
+  const metrics = await rpc(gateway.base, token.access_token, 26, "tools/call", { name: "paperclipGetRunMetrics", arguments: { runId: "33333333-3333-3333-3333-333333333333" } }, session);
+  assert.equal(metrics.json.result.structuredContent.toolCalls, 2);
+  assert.equal(metrics.json.result.structuredContent.testCalls, 1);
   const upstreamFailure = await rpc(gateway.base, token.access_token, 22, "tools/call", { name: "paperclipMe", arguments: {} }, session);
   assert.equal(upstreamFailure.status, 503);
 
@@ -192,6 +210,9 @@ test("public gateway routes skill modes through JSON-RPC and persists rotated re
   assert.equal(coo.status, 400);
   assert.equal(coo.json.error.data.code, "MODE_NOT_ALLOWED");
   assert.match(coo.json.error.message, /Mode EXECUTE is not allowed/);
+  const ctb = await rpc(gateway.base, token.access_token, callId + 1, "tools/call", { name: "paperclipUseSkill", arguments: { skill: "paperclip-napraw-tools", request: "Przebuduj architekturę OpenCode/Paperclip execution engine." } }, session);
+  assert.equal(ctb.status, 200);
+  assert.deepEqual(ctb.json.result.structuredContent, { CHANGE_CLASS: "CTB", HANDOFF_TO: "OpenCode CTB", RESULT: "HANDOFF", selectedSkill: "paperclip-napraw-tools" });
 
   await stopGateway(gateway.process);
   gateway = await startGateway({ storage, upstreamPort });

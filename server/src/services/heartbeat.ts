@@ -703,10 +703,12 @@ function isSandboxProviderWorkerUnavailableFailureMessage(value: unknown) {
   return /sandbox provider .* is installed via plugin .* but its worker is not running/i.test(value);
 }
 
-function isRetryableInteractionContinuationInfrastructureFailure(
+export function isRetryableInteractionContinuationInfrastructureFailure(
   run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">,
 ) {
-  if (run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE || run.errorCode === "process_lost") {
+  // Workspace validation is deterministic configuration state. Retrying it
+  // without a state change creates recovery churn instead of useful work.
+  if (run.errorCode === "process_lost") {
     return true;
   }
 

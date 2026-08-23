@@ -192,6 +192,14 @@ const waitForIssueWorkspaceServiceSchema = z.object({
   timeoutSeconds: z.number().int().positive().max(300).optional(),
 });
 
+// These are internal read bridges for the public gateway. They expose the
+// persisted Paperclip run records without reopening the generic API tool.
+const heartbeatRunEventsSchema = z.object({
+  runId: z.string().uuid(),
+  afterSeq: z.number().int().nonnegative().optional(),
+  limit: z.number().int().positive().max(200).optional(),
+});
+
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -291,6 +299,30 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       async ({ issueId, wakeCommentId }) => {
         const qs = wakeCommentId ? `?wakeCommentId=${encodeURIComponent(wakeCommentId)}` : "";
         return client.requestJson("GET", `/issues/${encodeURIComponent(issueId)}/heartbeat-context${qs}`);
+      },
+    ),
+    makeTool(
+      "paperclipListHeartbeatRunsForIssue",
+      "List persisted heartbeat runs correlated to an issue",
+      z.object({ issueId: issueIdSchema }),
+      async ({ issueId }) => client.requestJson("GET", `/issues/${encodeURIComponent(issueId)}/runs`),
+    ),
+    makeTool(
+      "paperclipGetHeartbeatRun",
+      "Get one persisted heartbeat run",
+      z.object({ runId: z.string().uuid() }),
+      async ({ runId }) => client.requestJson("GET", `/heartbeat-runs/${encodeURIComponent(runId)}`),
+    ),
+    makeTool(
+      "paperclipListHeartbeatRunEvents",
+      "List persisted ordered heartbeat run events",
+      heartbeatRunEventsSchema,
+      async ({ runId, afterSeq, limit }) => {
+        const params = new URLSearchParams();
+        if (afterSeq) params.set("afterSeq", String(afterSeq));
+        if (limit) params.set("limit", String(limit));
+        const query = params.toString();
+        return client.requestJson("GET", `/heartbeat-runs/${encodeURIComponent(runId)}/events${query ? `?${query}` : ""}`);
       },
     ),
     makeTool(

@@ -160,6 +160,81 @@ function ctbRunMetrics(run) {
   };
 }
 
+function durationMs(startedAt, finishedAt) {
+  const start = Date.parse(startedAt || "");
+  const finish = Date.parse(finishedAt || "");
+  return Number.isFinite(start) && Number.isFinite(finish) ? Math.max(0, finish - start) : null;
+}
+
+function heartbeatRunSummary(run) {
+  return {
+    runId: run.runId || run.id,
+    issueId: run.issueId || run.contextSnapshot?.issueId || null,
+    runKind: "heartbeat",
+    engine: run.adapterType || "paperclip",
+    adapter: run.adapterType || null,
+    status: run.status || "unknown",
+    startedAt: run.startedAt || run.createdAt || null,
+    finishedAt: run.finishedAt || null,
+    durationMs: durationMs(run.startedAt || run.createdAt, run.finishedAt),
+    supportedObservability: true,
+    reason: null,
+  };
+}
+
+function ctbRunSummary(run) {
+  return {
+    runId: run.runId,
+    issueId: run.paperclipIssueId || null,
+    runKind: "opencode_ctb",
+    engine: "opencode",
+    adapter: "opencode",
+    status: run.status || "unknown",
+    startedAt: run.createdAt || null,
+    finishedAt: run.finishedAt || null,
+    durationMs: ctbRunMetrics(run).durationMs,
+    supportedObservability: true,
+    reason: null,
+  };
+}
+
+function normalizeHeartbeatEvent(event) {
+  // Persisted heartbeat events are authoritative. Do not infer tool calls from
+  // LLM text; only expose fields the runtime explicitly recorded.
+  const payload = event?.payload && typeof event.payload === "object" ? event.payload : null;
+  return {
+    seq: event?.seq ?? null,
+    timestamp: event?.createdAt || null,
+    kind: event?.eventType || "runtime",
+    tool: typeof payload?.toolName === "string" ? payload.toolName : typeof payload?.tool === "string" ? payload.tool : null,
+    status: typeof payload?.status === "string" ? payload.status : event?.level === "error" ? "error" : null,
+    retry: typeof payload?.retry === "number" ? payload.retry : null,
+    durationMs: typeof payload?.durationMs === "number" ? payload.durationMs : null,
+    message: event?.message || null,
+    payload,
+  };
+}
+
+function heartbeatMetrics(run, events) {
+  const normalized = events.map(normalizeHeartbeatEvent);
+  const toolEvents = normalized.filter((event) => event.tool);
+  const telemetrySupported = toolEvents.length > 0;
+  return {
+    supportedObservability: telemetrySupported,
+    reason: telemetrySupported ? null : "The runtime persisted lifecycle events but no structured tool telemetry for this run.",
+    toolCalls: telemetrySupported ? toolEvents.length : null,
+    failedToolCalls: telemetrySupported ? toolEvents.filter((event) => event.status === "error").length : null,
+    retryCount: telemetrySupported ? toolEvents.reduce((count, event) => count + (event.retry || 0), 0) : null,
+    searchCalls: telemetrySupported ? toolEvents.filter((event) => event.tool === "search").length : null,
+    fileReads: telemetrySupported ? toolEvents.filter((event) => event.tool === "read").length : null,
+    fileWrites: telemetrySupported ? toolEvents.filter((event) => event.tool === "write").length : null,
+    testCalls: telemetrySupported ? toolEvents.filter((event) => event.tool === "test").length : null,
+    timeToFirstWriteMs: null,
+    timeToFirstTestMs: null,
+    durationMs: durationMs(run.startedAt || run.createdAt, run.finishedAt),
+  };
+}
+
 function auditWrite(input) {
   const entry = { timestamp: new Date().toISOString(), ...input };
   try {
@@ -915,20 +990,36 @@ async function handlePublicGatewayTool({ ps, payload, name, args }) {
     if (name === "paperclipListIssueRuns") {
       const issue = toolData(await callUpstreamTool(ps, "paperclipGetIssue", { issueId: args.issueId }));
       selectCompany(payload, issue.companyId);
-      const runs = ctbRuns().filter((run) => run.paperclipIssueId === issue.id || run.paperclipIssueId === args.issueId).map((run) => ({ runId: run.runId, engine: "opencode", status: run.status || "unknown", startedAt: run.createdAt || null, finishedAt: run.finishedAt || null, durationMs: ctbRunMetrics(run).durationMs }));
+      const heartbeatRuns = toolData(await callUpstreamTool(ps, "paperclipListHeartbeatRunsForIssue", { issueId: issue.id }));
+      const persistedRuns = Array.isArray(heartbeatRuns) ? heartbeatRuns : heartbeatRuns.runs || [];
+      const runs = [
+        ...persistedRuns.map((run) => heartbeatRunSummary(run)),
+        ...ctbRuns().filter((run) => run.paperclipIssueId === issue.id || run.paperclipIssueId === args.issueId).map(ctbRunSummary),
+      ];
       return rpcToolResult({ issueId: issue.id, runs });
     }
     if (name === "paperclipGetRunEvents" || name === "paperclipGetRunMetrics") {
       const run = ctbRuns().find((entry) => entry.runId === args.runId);
-      if (!run) return rpcError(-32002, "Run not found", { code: "RUN_NOT_FOUND" });
-      const issue = toolData(await callUpstreamTool(ps, "paperclipGetIssue", { issueId: run.paperclipIssueId }));
-      selectCompany(payload, issue.companyId);
-      if (name === "paperclipGetRunMetrics") return rpcToolResult({ runId: run.runId, ...ctbRunMetrics(run) });
-      const all = (Array.isArray(run.events) ? run.events : []).filter((event) => !args.kind || event.kind === args.kind);
+      if (run) {
+        const issue = toolData(await callUpstreamTool(ps, "paperclipGetIssue", { issueId: run.paperclipIssueId }));
+        selectCompany(payload, issue.companyId);
+        if (name === "paperclipGetRunMetrics") return rpcToolResult({ runId: run.runId, ...ctbRunMetrics(run), supportedObservability: true, reason: null });
+        const all = (Array.isArray(run.events) ? run.events : []).filter((event) => !args.kind || event.kind === args.kind);
+        const cursor = Number.isInteger(args.cursor) ? args.cursor : 0;
+        const limit = Number.isInteger(args.limit) ? args.limit : 100;
+        const events = all.slice(cursor, cursor + limit);
+        return rpcToolResult({ runId: run.runId, supportedObservability: true, reason: null, events, nextCursor: cursor + events.length < all.length ? cursor + events.length : null });
+      }
+      const heartbeatRun = toolData(await callUpstreamTool(ps, "paperclipGetHeartbeatRun", { runId: args.runId }));
+      selectCompany(payload, heartbeatRun.companyId);
+      const rawEvents = toolData(await callUpstreamTool(ps, "paperclipListHeartbeatRunEvents", { runId: args.runId, afterSeq: 0, limit: 200 }));
+      const all = Array.isArray(rawEvents) ? rawEvents : rawEvents.events || [];
+      if (name === "paperclipGetRunMetrics") return rpcToolResult({ runId: args.runId, ...heartbeatMetrics(heartbeatRun, all) });
+      const filtered = all.map(normalizeHeartbeatEvent).filter((event) => !args.kind || event.kind === args.kind);
       const cursor = Number.isInteger(args.cursor) ? args.cursor : 0;
       const limit = Number.isInteger(args.limit) ? args.limit : 100;
-      const events = all.slice(cursor, cursor + limit);
-      return rpcToolResult({ runId: run.runId, events, nextCursor: cursor + events.length < all.length ? cursor + events.length : null });
+      const events = filtered.slice(cursor, cursor + limit);
+      return rpcToolResult({ runId: args.runId, supportedObservability: true, reason: null, events, nextCursor: cursor + events.length < filtered.length ? cursor + events.length : null });
     }
     if (["paperclipListDocuments", "paperclipGetDocument", "paperclipGetDocumentHistory", "paperclipGetDocumentRevision", "paperclipUpdateDocument"].includes(name)) {
       const issue = toolData(await callUpstreamTool(ps, "paperclipGetIssue", { issueId: args.issueId }));

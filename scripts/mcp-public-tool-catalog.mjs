@@ -67,9 +67,9 @@ export const CHATGPT_PUBLIC_TOOL_DESCRIPTIONS = {
   paperclipListSkills: "List available Paperclip skills with names, descriptions and aliases. Use to discover which skill matches the user request before loading it.",
   paperclipGetSkill: "Get the full SKILL.md content for one Paperclip skill by name. Use after listing to load detailed instructions.",
   paperclipUseSkill: "Route a request through a Paperclip skill deterministically and return its execution envelope. Aliases map /debug /fix-tools /health /coo /runtime to skills.",
-  paperclipListIssueRuns: "List correlated OpenCode CTB runs for one accessible Paperclip issue. This is read-only.",
-  paperclipGetRunEvents: "Get normalized, secret-sanitized OpenCode CTB execution events for one accessible run. This is read-only.",
-  paperclipGetRunMetrics: "Get deterministic OpenCode CTB execution metrics for one accessible run. This is read-only.",
+  paperclipListIssueRuns: "List all known Paperclip and correlated OpenCode runs for one accessible issue. This is read-only.",
+  paperclipGetRunEvents: "Get ordered, persisted execution events for one accessible run. Unsupported telemetry is explicit. This is read-only.",
+  paperclipGetRunMetrics: "Get deterministic metrics from persisted execution telemetry for one accessible run. Unsupported fields are null. This is read-only.",
 };
 
 export function filterChatGptPublicTools(tools) {
