@@ -1063,6 +1063,49 @@ const plugin = definePlugin({
       };
     }
 
+    if (input.routeKey === "public-mcp-pages") {
+      return {
+        body: await listPages(ctx, {
+          companyId: input.companyId,
+          wikiId: stringField(input.query.wikiId),
+          spaceSlug: stringField(input.query.spaceSlug),
+          limit: typeof input.query.limit === "string" ? Number(input.query.limit) : null,
+        }),
+      };
+    }
+
+    if (input.routeKey === "public-mcp-page") {
+      const path = stringField(input.query.path);
+      if (!path) return { status: 400, body: { error: "path is required" } };
+      return {
+        body: await readWikiPage(ctx, {
+          companyId: input.companyId,
+          wikiId: stringField(input.query.wikiId),
+          spaceSlug: stringField(input.query.spaceSlug),
+          path,
+        }),
+      };
+    }
+
+    if (input.routeKey === "public-mcp-page-write") {
+      const body = input.body as Record<string, unknown> | null;
+      const path = stringField(body?.path);
+      const contents = stringField(body?.contents);
+      if (!path || contents == null) return { status: 400, body: { error: "path and contents are required" } };
+      return {
+        body: await writeWikiPage(ctx, {
+          companyId: input.companyId,
+          wikiId: stringField(body?.wikiId),
+          spaceSlug: stringField(body?.spaceSlug),
+          path,
+          contents,
+          expectedHash: stringField(body?.expectedHash),
+          summary: stringField(body?.summary),
+          writer: "agent_tool",
+        }),
+      };
+    }
+
     return { status: 404, body: { error: `Unknown LLM Wiki route: ${input.routeKey}` } };
   },
 

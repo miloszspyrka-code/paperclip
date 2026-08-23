@@ -1,6 +1,6 @@
 ---
 name: paperclip-deleguj-coo
-description: Use this skill to delegate a larger goal to COO for decomposition, ownership, real dependencies, deduplication and execution start. Do not use this skill to implement code yourself. Explicit aliases: /coo, /delegate-coo.
+description: Route a larger goal from the current operational entry point to the narrowest downstream owner with deduplication and real dependencies. When the execution actor is COO, never delegate to COO itself. Explicit aliases: /coo, /delegate-coo.
 ---
 
 # Paperclip Deleguj COO
@@ -16,8 +16,28 @@ limit 2; loops terminate with `HANDOFF_LOOP_BLOCKED`.
 ## Standard flow
 
 USER GOAL -> READ CURRENT PAPERCLIP STATE -> FIND EXISTING RELEVANT TASKS ->
-DETERMINE MISSING WORK -> SEND/ASSIGN TO COO -> COO CREATES OR UPDATES TASKS ->
+DETERMINE MISSING WORK -> ROUTE FROM CURRENT COO ENTRY TO THE NARROWEST OWNER ->
 ASSIGN OWNERS -> SET DEPENDENCIES -> START READY WORK
+
+When the MCP execution actor is COO, `paperclip-deleguj-coo` means downstream
+routing, never `COO -> COO`. Route engineering risk to CTO, implementation to
+Engineer, design to Designer, UI acceptance to UI QA, and marketing/onboarding
+to CMO. Escalate to CEO only for governance, control-plane, organization, or
+strategic decisions that exceed COO authority.
+
+## COO entry routing
+
+| Request class | Route |
+| --- | --- |
+| Engineering diagnosis, architecture, security, migration, or technical preflight | `COO -> CTO -> Engineer` when implementation is needed |
+| Scoped implementation after an established technical plan | `COO -> Engineer` |
+| Design or UX | `COO -> Designer` |
+| UI acceptance or browser regression | `COO -> UI QA` |
+| Marketing, onboarding, or email | `COO -> CMO` |
+| Governance, control plane, organization, or exceptional strategy | `COO -> CEO` only when COO authority is insufficient |
+
+Never create a CEO parent issue for a standard delivery request. Reuse the
+source issue and assign or hand off to the routed owner.
 
 Before creating anything, read the live Paperclip state. Inspect `backlog`,
 `todo`, `in_progress`, `in_review`, `blocked`, and recently `done` issues.

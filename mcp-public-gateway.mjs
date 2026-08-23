@@ -696,34 +696,22 @@ const PREFIXED = Object.keys(TARGETS).filter((a) => a !== DEFAULT_APP);
 
 function upstreamCall(app, upSessionId, payload) {
   const target = TARGETS[app];
-  const upstream = new URL(target.url);
-  const httpMod = upstream.protocol === "https:" ? https : http;
-  return new Promise((resolve, reject) => {
-    const headers = {
+  const url = new URL(target.path || "/mcp", target.url).toString();
+  return fetch(url, {
+    method: "POST",
+    headers: {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
       ...(upSessionId ? { "mcp-session-id": upSessionId } : {}),
       ...(target.token ? { authorization: `Bearer ${target.token}` } : {}),
-    };
-    const rq = httpMod.request({
-      hostname: upstream.hostname,
-      port: upstream.port || (upstream.protocol === "https:" ? 443 : 80),
-      method: "POST",
-      path: target.path || "/mcp",
-      headers,
-    }, (rsp) => {
-      let body = "";
-      rsp.setEncoding("utf8");
-      rsp.on("data", (c) => { body += c; });
-      rsp.on("end", () => {
-        let parsed = null;
-        try { parsed = JSON.parse(body); } catch { parsed = { jsonrpc: "2.0", error: { code: -32603, message: "Upstream invalid response" }, id: null }; }
-        resolve({ json: parsed, status: rsp.statusCode, upSessionId: rsp.headers["mcp-session-id"] || upSessionId });
-      });
-      rsp.on("error", reject);
-    });
-    rq.on("error", reject);
-    rq.end(JSON.stringify(payload));
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(30000),
+  }).then(async (response) => {
+    const body = await response.text();
+    let parsed = null;
+    try { parsed = JSON.parse(body); } catch { parsed = { jsonrpc: "2.0", error: { code: -32603, message: "Upstream invalid response" }, id: null }; }
+    return { json: parsed, status: response.status, upSessionId: response.headers.get("mcp-session-id") || upSessionId };
   });
 }
 
@@ -843,6 +831,14 @@ function wikiResource(page, companyId, spaceSlug) {
   };
 }
 
+async function callInternalApi(ps, method, path, jsonBody) {
+  return toolData(await callUpstreamTool(ps, "paperclipApiRequest", {
+    method,
+    path,
+    ...(jsonBody === undefined ? {} : { jsonBody: JSON.stringify(jsonBody) }),
+  }));
+}
+
 async function publicWikiCall(ps, payload, name, args, write = false) {
   const companyId = selectCompany(payload, args.companyId);
   const page = args.page ? assertPublicWikiPage(args.page) : null;
@@ -852,17 +848,25 @@ async function publicWikiCall(ps, payload, name, args, write = false) {
     ...(args.spaceSlug ? { spaceSlug: String(args.spaceSlug) } : {}),
     ...(page ? { path: page } : {}),
   };
-  if (name === "wiki_search") {
-    parameters.query = String(args.query || "");
-    parameters.limit = args.limit;
+  const query = new URLSearchParams({ companyId, wikiId: parameters.wikiId });
+  if (parameters.spaceSlug) query.set("spaceSlug", parameters.spaceSlug);
+  let data;
+  if (name === "wiki_list_pages" || name === "wiki_search") {
+    data = await callInternalApi(ps, "GET", `/plugins/paperclipai.plugin-llm-wiki/api/mcp-pages?${query}`);
+  } else if (name === "wiki_read_page") {
+    query.set("path", page);
+    data = await callInternalApi(ps, "GET", `/plugins/paperclipai.plugin-llm-wiki/api/mcp-page?${query}`);
+  } else if (name === "wiki_write_page") {
+    data = await callInternalApi(ps, "POST", "/plugins/paperclipai.plugin-llm-wiki/api/mcp-page", {
+      ...parameters,
+      contents: String(args.content || ""),
+      expectedHash: String(args.expectedHash || ""),
+      summary: typeof args.summary === "string" ? args.summary : "Public MCP Wiki update",
+    });
+  } else {
+    throw new Error(`Unsupported public Wiki operation: ${name}`);
   }
-  if (name === "wiki_propose_patch" || name === "wiki_write_page") {
-    parameters.contents = String(args.content || "");
-    parameters.expectedHash = String(args.expectedHash || "");
-    parameters.summary = typeof args.summary === "string" ? args.summary : "Public MCP Wiki update";
-  }
-  const result = await callUpstreamTool(ps, name, parameters);
-  return { companyId, page, spaceSlug: parameters.spaceSlug || "default", data: toolData(result), result, write };
+  return { companyId, page, spaceSlug: parameters.spaceSlug || "default", data, result: null, write };
 }
 
 async function handlePublicGatewayTool({ ps, payload, name, args }) {
@@ -910,10 +914,14 @@ async function handlePublicGatewayTool({ ps, payload, name, args }) {
     }
     if (name === "paperclipWikiSearch") {
       const call = await publicWikiCall(ps, payload, "wiki_search", args);
-      const results = Array.isArray(call.data.results) ? call.data.results : [];
-      return rpcToolResult({ results: results.filter((entry) => entry?.kind !== "source").map((entry) => {
+      const needle = String(args.query || "").trim().toLowerCase();
+      const pages = Array.isArray(call.data.pages) ? call.data.pages : [];
+      return rpcToolResult({ results: pages.filter((entry) => {
+        const text = `${entry.path || ""}\n${entry.title || ""}\n${entry.description || ""}\n${Array.isArray(entry.tags) ? entry.tags.join(" ") : ""}`.toLowerCase();
+        return !needle || text.includes(needle);
+      }).map((entry) => {
         const page = assertPublicWikiPage(entry.path);
-        return { slug: page.replace(/^wiki\//, "").replace(/\.md$/i, ""), title: entry.title || page, description: entry.description || `Wiki page: ${entry.title || page}.`, score: entry.score ?? 1, hash: entry.hash ?? null, tags: entry.tags || [] };
+        return { slug: page.replace(/^wiki\//, "").replace(/\.md$/i, ""), title: entry.title || page, description: entry.description || `Wiki page: ${entry.title || page}.`, score: needle && String(entry.title || "").toLowerCase().includes(needle) ? 1 : 0.8, hash: entry.hash || entry.contentHash || null, tags: entry.tags || [] };
       }) });
     }
     if (name === "paperclipWikiGetPage" || name === "paperclipWikiGetMetadata") {
@@ -967,7 +975,7 @@ async function listPublicResources(ps, payload) {
   if (hasScope(payload, "paperclip:wiki:read")) {
     for (const companyId of companyIds) {
       try {
-        const result = toolData(await callUpstreamTool(ps, "wiki_list_pages", { companyId, wikiId: "default" }));
+        const result = (await publicWikiCall(ps, payload, "wiki_list_pages", { companyId })).data;
         for (const page of result.pages || []) {
           try { resources.push(wikiResource(page, companyId, "default")); } catch {}
         }
@@ -980,7 +988,9 @@ async function listPublicResources(ps, payload) {
     for (const companyId of companyIds) {
       try {
         const issues = toolData(await callUpstreamTool(ps, "paperclipListIssues", { companyId }));
-        for (const issue of Array.isArray(issues) ? issues : issues.issues || []) {
+        // Resource discovery must stay bounded. The dedicated document tool lists
+        // an issue exhaustively after the caller has selected its scope.
+        for (const issue of (Array.isArray(issues) ? issues : issues.issues || []).slice(0, 5)) {
           const issueId = issue?.id;
           if (!issueId) continue;
           const documents = toolData(await callUpstreamTool(ps, "paperclipListDocuments", { issueId }));
@@ -1029,7 +1039,7 @@ async function readPublicResource(ps, payload, uri) {
     if (!hasScope(payload, "paperclip:wiki:read")) return rpcError(-32003, "INSUFFICIENT_SCOPE", { code: "INSUFFICIENT_SCOPE", requiredScope: "paperclip:wiki:read" });
     const companyId = selectCompany(payload, decodeURIComponent(wikiMatch[1]));
     const page = assertPublicWikiPage(decodeURIComponent(wikiMatch[2]));
-    const data = toolData(await callUpstreamTool(ps, "wiki_read_page", { companyId, wikiId: "default", path: page }));
+    const data = (await publicWikiCall(ps, payload, "wiki_read_page", { companyId, page })).data;
     return { result: { contents: [{ uri, mimeType: "text/markdown", text: data.contents || data.text || "", _meta: { companyId, hash: data.hash || null, page } }] } };
   }
   return null;

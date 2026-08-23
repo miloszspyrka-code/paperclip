@@ -49,6 +49,7 @@ diagnostics/
 .claude/settings.local.json
 .paperclip-local/
 .paperclip-runtime/
+/.secrets/
 /.idea/
 /.agents/
 

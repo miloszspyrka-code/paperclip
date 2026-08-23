@@ -569,6 +569,30 @@ const manifest: PaperclipPluginManifestV1 = {
       auth: "board",
       capability: "api.routes.register",
       companyResolution: { from: "body", key: "companyId" }
+    },
+    {
+      routeKey: "public-mcp-pages",
+      method: "GET",
+      path: "/mcp-pages",
+      auth: "agent",
+      capability: "api.routes.register",
+      companyResolution: { from: "query", key: "companyId" }
+    },
+    {
+      routeKey: "public-mcp-page",
+      method: "GET",
+      path: "/mcp-page",
+      auth: "agent",
+      capability: "api.routes.register",
+      companyResolution: { from: "query", key: "companyId" }
+    },
+    {
+      routeKey: "public-mcp-page-write",
+      method: "POST",
+      path: "/mcp-page",
+      auth: "agent",
+      capability: "api.routes.register",
+      companyResolution: { from: "body", key: "companyId" }
     }
   ],
   ui: {

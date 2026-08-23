@@ -237,13 +237,17 @@ test("public document and Wiki surface enforces scopes, grants, proposals, and r
     let result;
     if (message.method === "initialize") result = { protocolVersion: "2025-03-26", capabilities: {} };
     else if (message.method === "tools/list") result = { tools: ["paperclipListDocuments", "paperclipGetDocument"].map((tool) => ({ name: tool, description: tool, inputSchema: { type: "object" } })) };
-    else if (name === "wiki_list_pages") result = { structuredContent: { pages: [{ path: "wiki/sprawnosci-api.md", title: "Sprawności API", description: "Reguły pobierania i interpretacji danych API sprawności.", tags: ["api"], contentHash: pageHash(), updatedAt: "2026-08-23T00:00:00.000Z" }] } };
-    else if (name === "wiki_search") result = { structuredContent: { results: [{ kind: "page", path: "wiki/sprawnosci-api.md", title: "Sprawności API", hash: pageHash(), tags: ["api"] }] } };
-    else if (name === "wiki_read_page") result = { structuredContent: { contents: page, hash: pageHash() } };
-    else if (name === "wiki_write_page") {
-      if (args.expectedHash !== pageHash()) return res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "Refusing to overwrite stale page: expected hash" } }));
-      page = args.contents;
-      result = { structuredContent: { hash: pageHash() } };
+    else if (name === "paperclipApiRequest") {
+      const apiBody = args.jsonBody ? JSON.parse(args.jsonBody) : {};
+      if (args.path.startsWith("/plugins/paperclipai.plugin-llm-wiki/api/mcp-pages")) {
+        result = { structuredContent: { pages: [{ path: "wiki/sprawnosci-api.md", title: "Sprawności API", description: "Reguły pobierania i interpretacji danych API sprawności.", tags: ["api"], contentHash: pageHash(), updatedAt: "2026-08-23T00:00:00.000Z" }] } };
+      } else if (args.path.startsWith("/plugins/paperclipai.plugin-llm-wiki/api/mcp-page") && args.method === "GET") {
+        result = { structuredContent: { contents: page, hash: pageHash() } };
+      } else if (args.path === "/plugins/paperclipai.plugin-llm-wiki/api/mcp-page") {
+        if (apiBody.expectedHash !== pageHash()) return res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "Refusing to overwrite stale page: expected hash" } }));
+        page = apiBody.contents;
+        result = { structuredContent: { hash: pageHash() } };
+      } else result = { structuredContent: {} };
     } else if (name === "paperclipGetIssue") result = { structuredContent: { id: args.issueId, companyId } };
     else if (name === "paperclipListDocuments") result = { structuredContent: { documents: [{ id: "doc-1", key: "plan", title: "Plan", latestRevisionId: documentRevision, updatedAt: "2026-08-23T00:00:00.000Z" }] } };
     else if (name === "paperclipGetDocument") result = { structuredContent: { id: "doc-1", key: "plan", body: documentBody, latestRevisionId: documentRevision, companyId } };
