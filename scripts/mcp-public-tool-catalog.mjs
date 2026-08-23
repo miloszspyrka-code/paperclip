@@ -29,6 +29,9 @@ export const CHATGPT_PUBLIC_TOOL_NAMES = [
   "paperclipListSkills",
   "paperclipGetSkill",
   "paperclipUseSkill",
+  "paperclipListIssueRuns",
+  "paperclipGetRunEvents",
+  "paperclipGetRunMetrics",
 ];
 
 export const CHATGPT_PUBLIC_TOOL_NAME_SET = new Set(CHATGPT_PUBLIC_TOOL_NAMES);
@@ -64,6 +67,9 @@ export const CHATGPT_PUBLIC_TOOL_DESCRIPTIONS = {
   paperclipListSkills: "List available Paperclip skills with names, descriptions and aliases. Use to discover which skill matches the user request before loading it.",
   paperclipGetSkill: "Get the full SKILL.md content for one Paperclip skill by name. Use after listing to load detailed instructions.",
   paperclipUseSkill: "Route a request through a Paperclip skill deterministically and return its execution envelope. Aliases map /debug /fix-tools /health /coo /runtime to skills.",
+  paperclipListIssueRuns: "List correlated OpenCode CTB runs for one accessible Paperclip issue. This is read-only.",
+  paperclipGetRunEvents: "Get normalized, secret-sanitized OpenCode CTB execution events for one accessible run. This is read-only.",
+  paperclipGetRunMetrics: "Get deterministic OpenCode CTB execution metrics for one accessible run. This is read-only.",
 };
 
 export function filterChatGptPublicTools(tools) {
@@ -77,6 +83,9 @@ export function filterChatGptPublicTools(tools) {
 const companyId = { type: "string", format: "uuid", description: "Optional selection from the authenticated principal's granted companies." };
 
 export const PUBLIC_GATEWAY_TOOLS = [
+  ["paperclipListIssueRuns", { issueId: { type: "string" } }, ["issueId"]],
+  ["paperclipGetRunEvents", { runId: { type: "string" }, kind: { type: "string" }, cursor: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1, maximum: 200 } }, ["runId"]],
+  ["paperclipGetRunMetrics", { runId: { type: "string" } }, ["runId"]],
   ["paperclipGetDocumentHistory", { issueId: { type: "string" }, key: { type: "string" } }, ["issueId", "key"]],
   ["paperclipGetDocumentRevision", { issueId: { type: "string" }, key: { type: "string" }, revisionId: { type: "string" } }, ["issueId", "key", "revisionId"]],
   ["paperclipUpdateDocument", { issueId: { type: "string" }, key: { type: "string" }, baseRevisionId: { type: "string" }, content: { type: "string" }, title: { type: "string" }, changeSummary: { type: "string" } }, ["issueId", "key", "baseRevisionId", "content"]],

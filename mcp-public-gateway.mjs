@@ -52,6 +52,7 @@ const OPERATOR_SKILL_NAMES = [
   "wiki-propose-change",
   "wiki-apply-change",
 ];
+const CTB_RUN_REGISTRY_FILE = process.env.OPENCODE_CTB_RUN_REGISTRY_FILE || "C:\\Kompas Zbiórek\\opencode-mcp\\.runtime\\ctb-runs.json";
 const WIKI_PROPOSALS = new Map();
 const PUBLIC_GATEWAY_TOOL_NAMES = new Set([
   ...PUBLIC_GATEWAY_TOOLS.map((tool) => tool.name),
@@ -116,6 +117,47 @@ function rpcToolResult(data) {
 
 function rpcError(code, message, data = {}) {
   return { error: { code, message, data } };
+}
+
+function ctbRuns() {
+  try {
+    const parsed = JSON.parse(readFileSync(CTB_RUN_REGISTRY_FILE, "utf8"));
+    const records = parsed && typeof parsed === "object" && !Array.isArray(parsed) && parsed.runs && typeof parsed.runs === "object" ? parsed.runs : parsed;
+    return Object.values(records && typeof records === "object" ? records : {}).filter((run) => run && typeof run === "object" && typeof run.runId === "string");
+  } catch {
+    return [];
+  }
+}
+
+function ctbRunMetrics(run) {
+  const events = Array.isArray(run.events) ? run.events : [];
+  const toolEvents = events.filter((event) => ["tool", "mcp", "search", "file", "command", "test", "git"].includes(event.kind));
+  const fingerprints = new Set();
+  let duplicateCalls = 0;
+  for (const event of toolEvents) {
+    const fingerprint = `${event.kind}|${event.tool || event.action || ""}|${event.status || ""}`;
+    if (fingerprints.has(fingerprint)) duplicateCalls += 1;
+    else fingerprints.add(fingerprint);
+  }
+  const startedAt = Date.parse(run.createdAt || "") || 0;
+  const elapsed = (event) => { const timestamp = Date.parse(event.timestamp || "") || 0; return startedAt && timestamp ? Math.max(0, timestamp - startedAt) : null; };
+  const firstWrite = events.find((event) => event.kind === "file" && event.operation === "write");
+  const firstTest = events.find((event) => event.kind === "test");
+  const finishedAt = Date.parse(run.finishedAt || "") || startedAt;
+  return {
+    toolCalls: toolEvents.length,
+    failedToolCalls: toolEvents.filter((event) => event.status === "error").length,
+    retryCount: events.reduce((total, event) => total + (Number(event.retry) || 0), 0),
+    duplicateCalls,
+    searchCalls: events.filter((event) => event.kind === "search").length,
+    fileReads: events.filter((event) => event.kind === "file" && event.operation === "read").length,
+    fileWrites: events.filter((event) => event.kind === "file" && event.operation === "write").length,
+    testCalls: events.filter((event) => event.kind === "test").length,
+    mcpCalls: events.filter((event) => event.kind === "mcp").length,
+    timeToFirstWriteMs: firstWrite ? elapsed(firstWrite) : null,
+    timeToFirstTestMs: firstTest ? elapsed(firstTest) : null,
+    durationMs: startedAt ? Math.max(0, finishedAt - startedAt) : 0,
+  };
 }
 
 function auditWrite(input) {
@@ -765,12 +807,11 @@ async function aggregatedTools(ps) {
       log("aggregate tools/list fail", { app, error: String(e?.message || e) });
     }
   }
-  const filtered = filterChatGptPublicTools(out);
   for (const tool of PUBLIC_GATEWAY_TOOLS) {
-    if (!filtered.some((entry) => entry.name === tool.name)) filtered.push(tool);
+    if (!out.some((entry) => entry.name === tool.name)) out.push(tool);
   }
-  for (const t of gatewaySkillTools()) if (!filtered.some((x) => x.name === t.name)) filtered.push(t);
-  return filtered;
+  for (const tool of gatewaySkillTools()) if (!out.some((entry) => entry.name === tool.name)) out.push(tool);
+  return filterChatGptPublicTools(out);
 }
 
 async function callUpstreamTool(ps, name, args) {
@@ -871,6 +912,24 @@ async function publicWikiCall(ps, payload, name, args, write = false) {
 
 async function handlePublicGatewayTool({ ps, payload, name, args }) {
   try {
+    if (name === "paperclipListIssueRuns") {
+      const issue = toolData(await callUpstreamTool(ps, "paperclipGetIssue", { issueId: args.issueId }));
+      selectCompany(payload, issue.companyId);
+      const runs = ctbRuns().filter((run) => run.paperclipIssueId === issue.id || run.paperclipIssueId === args.issueId).map((run) => ({ runId: run.runId, engine: "opencode", status: run.status || "unknown", startedAt: run.createdAt || null, finishedAt: run.finishedAt || null, durationMs: ctbRunMetrics(run).durationMs }));
+      return rpcToolResult({ issueId: issue.id, runs });
+    }
+    if (name === "paperclipGetRunEvents" || name === "paperclipGetRunMetrics") {
+      const run = ctbRuns().find((entry) => entry.runId === args.runId);
+      if (!run) return rpcError(-32002, "Run not found", { code: "RUN_NOT_FOUND" });
+      const issue = toolData(await callUpstreamTool(ps, "paperclipGetIssue", { issueId: run.paperclipIssueId }));
+      selectCompany(payload, issue.companyId);
+      if (name === "paperclipGetRunMetrics") return rpcToolResult({ runId: run.runId, ...ctbRunMetrics(run) });
+      const all = (Array.isArray(run.events) ? run.events : []).filter((event) => !args.kind || event.kind === args.kind);
+      const cursor = Number.isInteger(args.cursor) ? args.cursor : 0;
+      const limit = Number.isInteger(args.limit) ? args.limit : 100;
+      const events = all.slice(cursor, cursor + limit);
+      return rpcToolResult({ runId: run.runId, events, nextCursor: cursor + events.length < all.length ? cursor + events.length : null });
+    }
     if (["paperclipListDocuments", "paperclipGetDocument", "paperclipGetDocumentHistory", "paperclipGetDocumentRevision", "paperclipUpdateDocument"].includes(name)) {
       const issue = toolData(await callUpstreamTool(ps, "paperclipGetIssue", { issueId: args.issueId }));
       selectCompany(payload, issue.companyId);

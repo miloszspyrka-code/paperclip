@@ -151,6 +151,27 @@ async function main() {
     output.boardOnlyResponse = boardOnlyText.slice(0, 240);
   }
 
+  if (process.env.PAPERCLIP_CTB_ISSUE_ID && process.env.PAPERCLIP_CTB_RUN_ID) {
+    const issueId = process.env.PAPERCLIP_CTB_ISSUE_ID;
+    const runId = process.env.PAPERCLIP_CTB_RUN_ID;
+    const runs = await rpc(20, "tools/call", { name: "paperclipListIssueRuns", arguments: { issueId } });
+    const events = await rpc(21, "tools/call", { name: "paperclipGetRunEvents", arguments: { runId } });
+    const metrics = await rpc(22, "tools/call", { name: "paperclipGetRunMetrics", arguments: { runId } });
+    const runData = runs.body.result?.structuredContent;
+    const eventData = events.body.result?.structuredContent;
+    const metricData = metrics.body.result?.structuredContent;
+    output.ctbObservability = {
+      statuses: { runs: runs.status, events: events.status, metrics: metrics.status },
+      errors: { runs: runs.body.error?.message || null, events: events.body.error?.message || null, metrics: metrics.body.error?.message || null },
+      runs: runs.status === 200 && Array.isArray(runData?.runs) && runData.runs.some((run) => run.runId === runId),
+      events: events.status === 200 && Array.isArray(eventData?.events) && eventData.events.some((event) => event.kind === "file" && event.operation === "write") && eventData.events.some((event) => event.kind === "test"),
+      metrics: metrics.status === 200 && metricData?.fileWrites > 0 && metricData?.testCalls > 0 && typeof metricData?.durationMs === "number",
+    };
+    if (!output.ctbObservability.runs || !output.ctbObservability.events || !output.ctbObservability.metrics) {
+      throw new Error(`CTB observability tools did not return the correlated tool-by-tool execution: ${JSON.stringify(output.ctbObservability)}`);
+    }
+  }
+
   console.log(JSON.stringify(output, null, 2));
 }
 

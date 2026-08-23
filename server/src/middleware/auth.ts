@@ -398,6 +398,16 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
+    const keyScope = normalizeAgentApiKeyScope(key.scopeConfig);
+    if (keyScope.kind === "read_only" && MUTATING_METHODS.has(req.method)) {
+      next(forbidden("Read-only agent keys cannot mutate Paperclip", { code: "READ_ONLY_KEY" }));
+      return;
+    }
+    if (keyScope.kind === "read_only" && !/^\/api\/issues\/[^/]+$/.test(req.path)) {
+      next(forbidden("Read-only agent keys can only validate an issue", { code: "READ_ONLY_KEY_SCOPE" }));
+      return;
+    }
+
     await db
       .update(agentApiKeys)
       .set({ lastUsedAt: new Date() })
@@ -434,7 +444,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       agentId: key.agentId,
       companyId: key.companyId,
       keyId: key.id,
-      keyScope: normalizeAgentApiKeyScope(key.scopeConfig),
+      keyScope,
       onBehalfOfUserId: responsibleUserId,
       onBehalfOfMemberships: await loadResponsibleUserMemberships(db, {
         companyId: key.companyId,

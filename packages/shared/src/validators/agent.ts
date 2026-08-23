@@ -160,10 +160,16 @@ export const skillTestAgentKeyScopeSchema = z.object({
   issueId: z.string().uuid(),
 }).strict();
 
+// Service integrations can inspect their company data, but never mutate it.
+export const readOnlyAgentKeyScopeSchema = z.object({
+  kind: z.literal("read_only"),
+}).strict();
+
 export const agentApiKeyScopeSchema = z.union([
   standardAgentKeyScopeSchema,
   taskBridgeAgentKeyScopeSchema,
   skillTestAgentKeyScopeSchema,
+  readOnlyAgentKeyScopeSchema,
 ]);
 
 export type AgentApiKeyScope = z.infer<typeof agentApiKeyScopeSchema>;
