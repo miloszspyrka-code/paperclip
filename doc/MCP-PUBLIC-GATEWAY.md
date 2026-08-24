@@ -22,6 +22,10 @@ Requests are classified before an execution envelope is created: routine work is
 
 Heartbeat run event sequences are unique per run: migration 0222 deduplicates historical `(run_id, seq)` collisions, adds a unique index, and concurrent writers retry with a freshly allocated sequence on conflict.
 
+## Operator Mutations on Existing Issues
+
+The public connector authenticates with an agent API key that carries a responsible user but no heartbeat run. `paperclipUpdateIssue` and `paperclipAddComment` on existing issues treat such header-less calls as interactive operator commands attributed to that responsible user, so reassigning or resuming an issue no longer fails with `cross_issue_influence_run_context_required`. Run-bound agent calls keep proving run ownership and stay under the per-run cross-issue influence cap; keys without a responsible user remain fail-closed.
+
 Workspace validation failures are deterministic preflight blockers. They are not eligible for interaction-continuation recovery retries until state changes.
 
 ## OAuth Refresh Tokens

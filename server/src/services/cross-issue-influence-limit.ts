@@ -34,6 +34,31 @@ export function crossIssueInfluenceRunContextError() {
   return forbidden(body.error, body.details);
 }
 
+export type CrossIssueInfluenceActor = {
+  type: string;
+  agentId?: string | null;
+  runId?: string | null;
+  source?: string | null;
+  onBehalfOfUserId?: string | null;
+};
+
+/**
+ * Whether a cross-issue mutation must prove heartbeat run ownership.
+ *
+ * Run-bound agents always do: the per-run cap is their containment. An agent
+ * API-key request WITHOUT any run header is an interactive operator command
+ * (public MCP connector, CLI) attributed to the key's responsible user by auth
+ * middleware and audited per mutation — there is no run scope to count against,
+ * so demanding one would permanently break the operator mutation path. It stays
+ * fail-closed whenever no responsible user backs the key.
+ */
+export function requiresCrossIssueInfluenceRunContext(actor: CrossIssueInfluenceActor): boolean {
+  if (actor.type !== "agent") return false;
+  if (!actor.agentId) return true;
+  if (actor.runId) return false;
+  return !(actor.source === "agent_key" && Boolean(actor.onBehalfOfUserId));
+}
+
 function readRunSourceIssueId(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
   const context = contextSnapshot as Record<string, unknown>;

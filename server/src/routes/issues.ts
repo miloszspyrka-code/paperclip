@@ -243,6 +243,7 @@ import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
   observeCrossIssueInfluence,
+  requiresCrossIssueInfluenceRunContext,
   type CrossIssueInfluenceKind,
 } from "../services/cross-issue-influence-limit.js";
 
@@ -2868,7 +2869,15 @@ export function issueRoutes(
     kind: CrossIssueInfluenceKind,
   ) {
     if (req.actor.type !== "agent") return true;
-    if (!req.actor.agentId || !req.actor.runId) throw crossIssueInfluenceRunContextError();
+    // Run-bound agents prove run ownership; header-less agent-key calls are
+    // interactive operator commands attributed to the key's responsible user
+    // (see requiresCrossIssueInfluenceRunContext).
+    if (requiresCrossIssueInfluenceRunContext(req.actor)) throw crossIssueInfluenceRunContextError();
+    if (!req.actor.agentId || !req.actor.runId) {
+      // Operator-command branch: attribution already covers accountability,
+      // and there is no run scope to count cross-issue influence against.
+      return true;
+    }
 
     // The counter transaction locks and validates the persisted run before it
     // derives the source issue. Never trust the API-key run header by itself.

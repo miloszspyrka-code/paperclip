@@ -178,7 +178,8 @@ function registerRouteMocks() {
     logActivity: mockLogActivity,
   }));
 
-  vi.doMock("../services/cross-issue-influence-limit.js", () => ({
+  vi.doMock("../services/cross-issue-influence-limit.js", async (importOriginal) => ({
+    ...(await importOriginal<Record<string, unknown>>()),
     observeCrossIssueInfluence: mockObserveCrossIssueInfluence,
     crossIssueInfluenceLimitError: vi.fn(),
     crossIssueInfluenceRunContextError: () => new HttpError(
