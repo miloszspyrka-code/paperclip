@@ -115,6 +115,57 @@ function rpcToolResult(data) {
   return { result: { content: [{ type: "text", text: JSON.stringify(data) }], structuredContent: data } };
 }
 
+// ChatGPT's streamable-HTTP client drops the connection ("Error in message
+// stream") when a tools/call takes longer than its idle timeout, because the
+// gateway previously sent nothing until the tool finished. When the client
+// accepts SSE, respond immediately as an event stream and emit keepalive
+// comments while the tool runs; deliver the JSON-RPC response as one final
+// message frame (MCP streamable HTTP allows exactly this shape).
+function wantsSse(req) {
+  return String(req.headers.accept || "").includes("text/event-stream");
+}
+
+async function sendToolResponse(req, res, sessionHeaders, work) {
+  if (!wantsSse(req)) {
+    const response = await work();
+    return sendJson(res, response.status, response.body, sessionHeaders);
+  }
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    ...(sessionHeaders["mcp-session-id"] ? { "mcp-session-id": sessionHeaders["mcp-session-id"] } : {}),
+  });
+  // A client disconnect must never escape as a secondary exception: an
+  // uncaught write-after-reset kills the whole gateway and every concurrent
+  // caller sees ECONNRESET.
+  const safeWrite = (chunk) => {
+    try {
+      if (!res.destroyed && !res.writableEnded) res.write(chunk);
+    } catch {}
+  };
+  let finished = false;
+  const keepalive = setInterval(() => {
+    if (!finished) safeWrite(": keepalive\n\n");
+  }, 5000);
+  res.on("close", () => {
+    finished = true;
+    clearInterval(keepalive);
+  });
+  try {
+    const response = await work();
+    safeWrite(`event: message\ndata: ${JSON.stringify(response.body)}\n\n`);
+    try { if (!res.destroyed && !res.writableEnded) res.end(); } catch {}
+  } catch (error) {
+    log("tools/call sse failure", { error: String(error?.message || error) });
+    safeWrite(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32603, message: "Tool execution failed" } })}\n\n`);
+    try { if (!res.destroyed && !res.writableEnded) res.end(); } catch {}
+  } finally {
+    finished = true;
+    clearInterval(keepalive);
+  }
+}
+
 function rpcError(code, message, data = {}) {
   return { error: { code, message, data } };
 }
@@ -1016,22 +1067,28 @@ async function handlePublicGatewayTool({ ps, payload, name, args }) {
       // per run with a bounded window; older runs stay explicitly unverified
       // instead of claiming support.
       const verificationWindow = 25;
-      const summaries = [];
-      for (const [index, run] of persistedRuns.entries()) {
-        if (index >= verificationWindow) {
-          summaries.push(heartbeatRunSummary(run));
-          continue;
-        }
-        let observability;
-        try {
-          const rawEvents = toolData(await callUpstreamTool(ps, "paperclipListHeartbeatRunEvents", { runId: run.runId || run.id, afterSeq: 0, limit: 200 }));
-          const events = Array.isArray(rawEvents) ? rawEvents : rawEvents.events || [];
-          const verdict = heartbeatObservability(run, events);
-          observability = { supported: verdict.supported, reason: verdict.reason };
-        } catch {
-          observability = { supported: null, reason: "observability support could not be verified" };
-        }
-        summaries.push(heartbeatRunSummary(run, observability));
+      // Verify in bounded parallel batches: a sequential loop of upstream
+      // roundtrips made this tool slow enough for streaming clients to abort.
+      const verificationBatch = 6;
+      const summaries = new Array(persistedRuns.length);
+      for (let start = 0; start < Math.min(persistedRuns.length, verificationWindow); start += verificationBatch) {
+        const batch = persistedRuns.slice(start, start + verificationBatch);
+        await Promise.all(batch.map(async (run, offset) => {
+          const index = start + offset;
+          let observability;
+          try {
+            const rawEvents = toolData(await callUpstreamTool(ps, "paperclipListHeartbeatRunEvents", { runId: run.runId || run.id, afterSeq: 0, limit: 200 }));
+            const events = Array.isArray(rawEvents) ? rawEvents : rawEvents.events || [];
+            const verdict = heartbeatObservability(run, events);
+            observability = { supported: verdict.supported, reason: verdict.reason };
+          } catch {
+            observability = { supported: null, reason: "observability support could not be verified" };
+          }
+          summaries[index] = heartbeatRunSummary(run, observability);
+        }));
+      }
+      for (let index = verificationWindow; index < persistedRuns.length; index += 1) {
+        summaries[index] = heartbeatRunSummary(persistedRuns[index]);
       }
       const runs = [
         ...summaries,
@@ -1326,8 +1383,11 @@ async function handleAggregate(req, res) {
         }
         ps.operation.writesUsed += 1;
       }
-      const response = await handlePublicGatewayTool({ ps, payload, name, args: msg.params?.arguments || {} });
-      return sendJson(res, response.error ? 400 : 200, { jsonrpc: "2.0", id, ...response });
+      const sessionHeaders = isNew ? { "mcp-session-id": ps.sid } : {};
+      await sendToolResponse(req, res, sessionHeaders, async () => {
+        const response = await handlePublicGatewayTool({ ps, payload, name, args: msg.params?.arguments || {} });
+        return { status: response.error ? 400 : 200, body: { jsonrpc: "2.0", id, ...response } };
+      });
     }
     if (app === DEFAULT_APP && !CHATGPT_PUBLIC_TOOL_NAME_SET.has(name)) {
       return sendJson(res, 404, { jsonrpc: "2.0", id, error: { code: -32601, message: "Tool is not available in the public catalog" } });
@@ -1358,12 +1418,18 @@ async function handleAggregate(req, res) {
       }
     }
     try {
-      const rec = await ensureUpSession(ps, app);
-      const r = await upstreamCall(app, rec.upId, { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: msg.params?.arguments || {} } });
-      res.writeHead(r.status || 200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify(r.json));
+      const sessionHeaders = isNew ? { "mcp-session-id": ps.sid } : {};
+      await sendToolResponse(req, res, sessionHeaders, async () => {
+        const rec = await ensureUpSession(ps, app);
+        const r = await upstreamCall(app, rec.upId, { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: msg.params?.arguments || {} } });
+        return { status: r.status || 200, body: r.json };
+      });
     } catch (e) {
       log("aggregate tools/call fail", { app, tool: name, error: String(e?.message || e) });
+      if (res.headersSent) {
+        try { if (!res.writableEnded) res.end(); } catch {}
+        return;
+      }
       return sendJson(res, 502, { jsonrpc: "2.0", id, error: { code: -32603, message: "Upstream unavailable" } });
     }
   }
@@ -1431,6 +1497,12 @@ async function handleAggregate(req, res) {
     return res.end(JSON.stringify({ jsonrpc: "2.0", id, result: { prompts: [] } }));
   }
 
+    // A second response on an already-answered socket aborts the whole gateway
+    // (ERR_HTTP_HEADERS_SENT is thrown from writeHead and nothing catches it).
+  if (res.headersSent) {
+    log('duplicate respond suppressed', { method });
+    return res.end();
+  }
   res.writeHead(200, { "Content-Type": "application/json" });
   return res.end(JSON.stringify({ jsonrpc: "2.0", id: id ?? null, error: { code: -32601, message: `Method not found: ${method}` } }));
 }
