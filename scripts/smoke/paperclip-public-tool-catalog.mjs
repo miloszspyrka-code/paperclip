@@ -189,6 +189,9 @@ async function main() {
     if (events.status !== 200 || metrics.status !== 200 || !Array.isArray(eventData?.events) || typeof metricData?.supportedObservability !== "boolean") {
       throw new Error(`Persisted Paperclip observability failed: ${JSON.stringify({ events: events.body, metrics: metrics.body })}`);
     }
+    if (run.supportedObservability !== null && run.supportedObservability !== metricData.supportedObservability) {
+      throw new Error(`supportedObservability is inconsistent between endpoints for the same run: list=${run.supportedObservability} metrics=${metricData.supportedObservability}`);
+    }
     output.paperclipRunObservability = {
       issueId,
       runId: run.runId,

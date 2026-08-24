@@ -166,7 +166,7 @@ function durationMs(startedAt, finishedAt) {
   return Number.isFinite(start) && Number.isFinite(finish) ? Math.max(0, finish - start) : null;
 }
 
-function heartbeatRunSummary(run) {
+function heartbeatRunSummary(run, observability = { supported: null, reason: "observability support unverified beyond the correlation window" }) {
   return {
     runId: run.runId || run.id,
     issueId: run.issueId || run.contextSnapshot?.issueId || null,
@@ -177,8 +177,8 @@ function heartbeatRunSummary(run) {
     startedAt: run.startedAt || run.createdAt || null,
     finishedAt: run.finishedAt || null,
     durationMs: durationMs(run.startedAt || run.createdAt, run.finishedAt),
-    supportedObservability: true,
-    reason: null,
+    supportedObservability: observability.supported,
+    reason: observability.reason,
   };
 }
 
@@ -195,6 +195,25 @@ function ctbRunSummary(run) {
     durationMs: ctbRunMetrics(run).durationMs,
     supportedObservability: true,
     reason: null,
+  };
+}
+
+function heartbeatToolEvents(normalizedEvents) {
+  return normalizedEvents.filter((event) => event.tool);
+}
+
+// Single source of truth for the supportedObservability flag. All three
+// endpoints derive it the same way: a run supports observability only when the
+// runtime persisted structured tool telemetry. Lifecycle-only runs report
+// false with an explicit reason instead of an inconsistent true.
+function heartbeatObservability(run, events) {
+  const normalized = events.map(normalizeHeartbeatEvent);
+  if (heartbeatToolEvents(normalized).length > 0) {
+    return { supported: true, reason: null };
+  }
+  return {
+    supported: false,
+    reason: "The runtime persisted lifecycle events but no structured tool telemetry for this run.",
   };
 }
 
@@ -217,7 +236,7 @@ function normalizeHeartbeatEvent(event) {
 
 function heartbeatMetrics(run, events) {
   const normalized = events.map(normalizeHeartbeatEvent);
-  const toolEvents = normalized.filter((event) => event.tool);
+  const toolEvents = heartbeatToolEvents(normalized);
   const telemetrySupported = toolEvents.length > 0;
   return {
     supportedObservability: telemetrySupported,
@@ -992,8 +1011,30 @@ async function handlePublicGatewayTool({ ps, payload, name, args }) {
       selectCompany(payload, issue.companyId);
       const heartbeatRuns = toolData(await callUpstreamTool(ps, "paperclipListHeartbeatRunsForIssue", { issueId: issue.id }));
       const persistedRuns = Array.isArray(heartbeatRuns) ? heartbeatRuns : heartbeatRuns.runs || [];
+      // supportedObservability must mean the same thing on every endpoint:
+      // structured tool telemetry present in the persisted events. Verify it
+      // per run with a bounded window; older runs stay explicitly unverified
+      // instead of claiming support.
+      const verificationWindow = 25;
+      const summaries = [];
+      for (const [index, run] of persistedRuns.entries()) {
+        if (index >= verificationWindow) {
+          summaries.push(heartbeatRunSummary(run));
+          continue;
+        }
+        let observability;
+        try {
+          const rawEvents = toolData(await callUpstreamTool(ps, "paperclipListHeartbeatRunEvents", { runId: run.runId || run.id, afterSeq: 0, limit: 200 }));
+          const events = Array.isArray(rawEvents) ? rawEvents : rawEvents.events || [];
+          const verdict = heartbeatObservability(run, events);
+          observability = { supported: verdict.supported, reason: verdict.reason };
+        } catch {
+          observability = { supported: null, reason: "observability support could not be verified" };
+        }
+        summaries.push(heartbeatRunSummary(run, observability));
+      }
       const runs = [
-        ...persistedRuns.map((run) => heartbeatRunSummary(run)),
+        ...summaries,
         ...ctbRuns().filter((run) => run.paperclipIssueId === issue.id || run.paperclipIssueId === args.issueId).map(ctbRunSummary),
       ];
       return rpcToolResult({ issueId: issue.id, runs });
@@ -1014,12 +1055,13 @@ async function handlePublicGatewayTool({ ps, payload, name, args }) {
       selectCompany(payload, heartbeatRun.companyId);
       const rawEvents = toolData(await callUpstreamTool(ps, "paperclipListHeartbeatRunEvents", { runId: args.runId, afterSeq: 0, limit: 200 }));
       const all = Array.isArray(rawEvents) ? rawEvents : rawEvents.events || [];
+      const observability = heartbeatObservability(heartbeatRun, all);
       if (name === "paperclipGetRunMetrics") return rpcToolResult({ runId: args.runId, ...heartbeatMetrics(heartbeatRun, all) });
       const filtered = all.map(normalizeHeartbeatEvent).filter((event) => !args.kind || event.kind === args.kind);
       const cursor = Number.isInteger(args.cursor) ? args.cursor : 0;
       const limit = Number.isInteger(args.limit) ? args.limit : 100;
       const events = filtered.slice(cursor, cursor + limit);
-      return rpcToolResult({ runId: args.runId, supportedObservability: true, reason: null, events, nextCursor: cursor + events.length < filtered.length ? cursor + events.length : null });
+      return rpcToolResult({ runId: args.runId, supportedObservability: observability.supported, reason: observability.reason, events, nextCursor: cursor + events.length < filtered.length ? cursor + events.length : null });
     }
     if (["paperclipListDocuments", "paperclipGetDocument", "paperclipGetDocumentHistory", "paperclipGetDocumentRevision", "paperclipUpdateDocument"].includes(name)) {
       const issue = toolData(await callUpstreamTool(ps, "paperclipGetIssue", { issueId: args.issueId }));

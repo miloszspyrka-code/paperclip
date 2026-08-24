@@ -33,6 +33,7 @@ import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
+import { insertRunEventWithSeqRetry } from "../run-event-seq-retry.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
@@ -1567,17 +1568,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       payload?: Record<string, unknown>;
     },
   ) {
-    await db.insert(heartbeatRunEvents).values({
-      companyId: run.companyId,
-      runId: run.id,
-      agentId: run.agentId,
-      seq: await nextRunEventSeq(run.id),
-      eventType: "lifecycle",
-      stream: "system",
-      level: event.level,
-      message: event.message,
-      payload: event.payload ?? null,
-    });
+    await insertRunEventWithSeqRetry(
+      (candidateSeq) => db.insert(heartbeatRunEvents).values({
+        companyId: run.companyId,
+        runId: run.id,
+        agentId: run.agentId,
+        seq: candidateSeq,
+        eventType: "lifecycle",
+        stream: "system",
+        level: event.level,
+        message: event.message,
+        payload: event.payload ?? null,
+      }),
+      await nextRunEventSeq(run.id),
+      () => nextRunEventSeq(run.id),
+    );
   }
 
   async function cleanupSourceResolvedRunProcess(input: {

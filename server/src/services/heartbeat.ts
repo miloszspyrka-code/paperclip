@@ -81,6 +81,7 @@ import {
 // git-credentials module became its canonical home; existing importers keep working.
 export { scrubGitCredentialText };
 import { publishLiveEvent } from "./live-events.js";
+import { insertRunEventWithSeqRetry } from "./run-event-seq-retry.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
@@ -9780,18 +9781,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       at: eventAt,
     });
 
-    await db.insert(heartbeatRunEvents).values({
-      companyId: run.companyId,
-      runId: run.id,
-      agentId: run.agentId,
+    const effectiveSeq = await insertRunEventWithSeqRetry(
+      (candidateSeq) => db.insert(heartbeatRunEvents).values({
+        companyId: run.companyId,
+        runId: run.id,
+        agentId: run.agentId,
+        seq: candidateSeq,
+        eventType: event.eventType,
+        stream: event.stream,
+        level: event.level,
+        color: event.color,
+        message: sanitizedMessage,
+        payload: sanitizedPayload,
+      }),
       seq,
-      eventType: event.eventType,
-      stream: event.stream,
-      level: event.level,
-      color: event.color,
-      message: sanitizedMessage,
-      payload: sanitizedPayload,
-    });
+      () => nextRunEventSeq(run.id),
+    );
 
     publishLiveEvent({
       companyId: run.companyId,
@@ -9800,7 +9805,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         runId: run.id,
         agentId: run.agentId,
         issueId,
-        seq,
+        seq: effectiveSeq,
         eventType: event.eventType,
         stream: event.stream ?? null,
         level: event.level ?? null,

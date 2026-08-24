@@ -18,7 +18,9 @@ Requests are classified before an execution envelope is created: routine work is
 
 ## Run Observability
 
-`paperclipListIssueRuns` unifies persisted `heartbeat_runs` with the existing OpenCode CTB registry. Every known run returns its identity, kind, adapter/engine, status, timestamps, duration, and observability support. `paperclipGetRunEvents` returns only persisted ordered runtime events. `paperclipGetRunMetrics` derives tool metrics only from structured event payloads; a run without that telemetry returns explicit support status and `null` metric fields instead of invented values.
+`paperclipListIssueRuns` unifies persisted `heartbeat_runs` with the existing OpenCode CTB registry. Every known run returns its identity, kind, adapter/engine, status, timestamps, duration, and observability support. `supportedObservability` has one meaning on every endpoint: structured tool telemetry exists in the persisted events for that run. A lifecycle-only run reports `false` with an explicit reason everywhere (list, events, metrics); runs beyond the per-issue verification window report `null` with `observability support unverified`. `paperclipGetRunEvents` returns only persisted ordered runtime events. `paperclipGetRunMetrics` derives tool metrics only from structured event payloads and reports `null` metric fields instead of invented values.
+
+Heartbeat run event sequences are unique per run: migration 0222 deduplicates historical `(run_id, seq)` collisions, adds a unique index, and concurrent writers retry with a freshly allocated sequence on conflict.
 
 Workspace validation failures are deterministic preflight blockers. They are not eligible for interaction-continuation recovery retries until state changes.
 
