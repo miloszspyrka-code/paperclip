@@ -145,6 +145,12 @@ export interface AdapterInvocationMeta {
   env?: Record<string, string>;
   prompt?: string;
   promptMetrics?: Record<string, number>;
+  /**
+   * Adapter-reported runtime diagnostics for the run (e.g. BEFORE/AFTER MCP
+   * tool-surface measurement under `mcp.serverNames`). Optional; adapters that
+   * do not measure their runtime surface simply omit it.
+   */
+  runtimeDiagnostics?: Record<string, unknown>;
   context?: Record<string, unknown>;
 }
 

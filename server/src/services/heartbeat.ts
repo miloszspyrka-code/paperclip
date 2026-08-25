@@ -131,6 +131,11 @@ import {
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
+import {
+  ISSUE_RUN_BUDGET_LOOKBACK_MS,
+  evaluateIssueRunBudget,
+  resolveIssueRunBudgetTier,
+} from "./issue-run-budget.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
 import {
   buildWorkspaceReadyComment,
@@ -18754,6 +18759,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               });
               return { kind: "skipped" as const };
             }
+          }
+
+          // Bounded per-issue run budget: this wake carries no new information
+          // (same candidate class as the rewake throttle above). Once the issue
+          // has consumed its terminal-run budget within the lookback window,
+          // hold further unconditional heartbeats - the sanctioned next steps
+          // are an explicit operator continue (human comment / resume), marking
+          // blocked, or escalation/reassignment. Event-carrying wakes never
+          // reach this branch, so human input always gets through.
+          const budgetTier = resolveIssueRunBudgetTier({
+            runtimeConfig: agent.runtimeConfig,
+            env: process.env,
+          });
+          const budgetRows = await tx
+            .select({ used: sql<number>`count(*)::int` })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.companyId, agent.companyId),
+                eq(heartbeatRuns.agentId, agentId),
+                sql`${heartbeatRuns.finishedAt} is not null`,
+                gte(heartbeatRuns.finishedAt, new Date(throttleNow.getTime() - ISSUE_RUN_BUDGET_LOOKBACK_MS)),
+                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+              ),
+            );
+          const budgetDecision = evaluateIssueRunBudget({
+            limit: budgetTier.limit,
+            used: Number(budgetRows[0]?.used ?? 0),
+          });
+          if (budgetDecision.action === "compact_and_hold") {
+            await tx.insert(agentWakeupRequests).values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "issue_run_budget_exhausted",
+              payload: {
+                ...(payload ?? {}),
+                issueId,
+                heartbeatSkip: {
+                  reason: "issue_run_budget_exhausted",
+                  requestedReason: reason,
+                  tier: budgetTier.tier,
+                  limit: budgetDecision.limit,
+                  used: budgetDecision.used,
+                  lookbackMs: ISSUE_RUN_BUDGET_LOOKBACK_MS,
+                  requiredExplicitAction: "continue | mark blocked | escalate/reassign",
+                },
+              },
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: throttleNow,
+            });
+            return { kind: "skipped" as const };
           }
         }
 

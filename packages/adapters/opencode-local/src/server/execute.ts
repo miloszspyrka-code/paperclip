@@ -56,6 +56,11 @@ import {
 } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
+import {
+  applyOpenCodeSessionRotation,
+  resolveOpenCodeSessionRotation,
+  savedResumeCount,
+} from "./session-policy.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -492,7 +497,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       runtimeSessionId.length > 0 &&
       (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
       adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
-    const sessionId = canResumeSession ? runtimeSessionId : null;
+
+    // Bounded session rotation: cap consecutive resumes of one OpenCode session
+    // so long-running issues stop replaying an ever growing conversation at full
+    // price. At the cap the run starts a compact fresh session; the structured
+    // wake context (objective, decisions, changed files, tests, blockers, next
+    // action) keeps continuity without the stale history.
+    const sessionRotation = resolveOpenCodeSessionRotation({ config, env });
+    const rotation = applyOpenCodeSessionRotation({
+      canResumeSession,
+      savedSessionId: runtimeSessionId,
+      savedResumeCount: savedResumeCount(runtimeSessionParams.resumeCount),
+      maxResumes: sessionRotation.maxResumes,
+    });
+    const sessionId = rotation.resumeSessionId;
+    if (rotation.rotated && runtimeSessionId) {
+      await onLog("stdout", `[paperclip] ${rotation.rotationReason}\n`);
+    }
     if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
       await onLog(
         "stdout",
@@ -608,6 +629,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           env: loggedEnv,
           prompt,
           promptMetrics,
+          runtimeDiagnostics: preparedRuntimeConfig.runtimeDiagnostics as Record<string, unknown>,
           context,
         });
       }
@@ -638,6 +660,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         parsed: ReturnType<typeof parseOpenCodeJsonl>;
       },
       clearSessionOnMissingSession = false,
+      resultResumeCount = rotation.nextResumeCount,
     ): AdapterExecutionResult => {
       if (attempt.proc.timedOut) {
         return {
@@ -656,6 +679,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? ({
             sessionId: resolvedSessionId,
             cwd: effectiveExecutionCwd,
+            resumeCount: resultResumeCount,
             ...(workspaceId ? { workspaceId } : {}),
             ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
             ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
@@ -722,7 +746,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `[paperclip] OpenCode session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
         const retry = await runAttempt(null);
-        return toResult(retry, true);
+        return toResult(retry, true, 0);
       }
 
       return toResult(initial);

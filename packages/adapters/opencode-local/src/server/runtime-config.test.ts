@@ -321,4 +321,132 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     expect(prepared.notes).toEqual([]);
     await prepared.cleanup();
   });
+
+  describe("mcp tool surface", () => {
+    const mcpFixture = {
+      github: { type: "remote", url: "https://mcp.example.com/github" },
+      "github-alias": { type: "remote", url: "https://mcp.example.com/github" },
+      filesystem: { type: "local", command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem"] },
+      slack: { type: "remote", url: "https://mcp.example.com/slack" },
+    };
+
+    it("measures the surface without changing behavior when no filter is configured", async () => {
+      const configHome = await makeConfigHome({ permission: {}, mcp: mcpFixture });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      expect(prepared.notes.some((note) => note.includes("MCP tool surface: 4 server(s) configured -> 4 enabled"))).toBe(true);
+      const runtimeConfig = JSON.parse(
+        await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+      ) as Record<string, unknown>;
+      expect(runtimeConfig.mcp).toEqual(mcpFixture);
+      await prepared.cleanup();
+    });
+
+    it("emits no tool-surface note when no mcp block is configured", async () => {
+      const configHome = await makeConfigHome({ permission: {} });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+      expect(prepared.notes.some((note) => note.includes("MCP tool surface"))).toBe(false);
+      await prepared.cleanup();
+    });
+
+    it("applies a config allowlist and collapses duplicate aliases", async () => {
+      const configHome = await makeConfigHome({ permission: {}, mcp: mcpFixture });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: { toolSurface: { mcpAllowlist: ["github", "github-alias", "filesystem"] } },
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      const runtimeConfig = JSON.parse(
+        await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+      ) as { mcp?: Record<string, unknown> };
+      expect(Object.keys(runtimeConfig.mcp ?? {}).sort()).toEqual(["filesystem", "github"]);
+      const note = prepared.notes.find((candidate) => candidate.includes("MCP tool surface"));
+      expect(note).toContain("allowlist removed: slack");
+      expect(note).toContain("duplicate aliases collapsed: github-alias (= github)");
+      expect(note).toContain("-> 2 enabled");
+      await prepared.cleanup();
+    });
+
+    it("applies an env denylist over the run env", async () => {
+      const configHome = await makeConfigHome({ permission: {}, mcp: mcpFixture });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome, PAPERCLIP_OPENCODE_MCP_DENYLIST: "slack, filesystem" },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      const runtimeConfig = JSON.parse(
+        await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+      ) as { mcp?: Record<string, unknown> };
+      expect(Object.keys(runtimeConfig.mcp ?? {}).sort()).toEqual(["github"]);
+      const note = prepared.notes.find((candidate) => candidate.includes("MCP tool surface"));
+      expect(note).toContain("denylist removed: filesystem, slack");
+      expect(note).toContain("duplicate aliases collapsed: github-alias (= github)");
+      await prepared.cleanup();
+    });
+
+    it("carries a BEFORE/AFTER runtimeDiagnostics.mcp.serverNames fixture for an unfiltered surface", async () => {
+      const configHome = await makeConfigHome({ permission: {}, mcp: mcpFixture });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      expect(prepared.runtimeDiagnostics).toEqual({
+        mcp: {
+          serverNames: {
+            before: ["github", "github-alias", "filesystem", "slack"],
+            after: ["github", "github-alias", "filesystem", "slack"],
+          },
+          removedByAllowlist: [],
+          removedByDenylist: [],
+          removedAsAliases: [],
+        },
+      });
+      await prepared.cleanup();
+    });
+
+    it("carries a BEFORE/AFTER runtimeDiagnostics.mcp.serverNames fixture for a filtered surface", async () => {
+      const configHome = await makeConfigHome({ permission: {}, mcp: mcpFixture });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: { toolSurface: { mcpAllowlist: ["github", "github-alias", "filesystem"] } },
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      expect(prepared.runtimeDiagnostics).toEqual({
+        mcp: {
+          serverNames: {
+            before: ["github", "github-alias", "filesystem", "slack"],
+            after: ["github", "filesystem"],
+          },
+          removedByAllowlist: ["slack"],
+          removedByDenylist: [],
+          removedAsAliases: ["github-alias (= github)"],
+        },
+      });
+      await prepared.cleanup();
+    });
+
+    it("emits empty runtime diagnostics when no mcp block is configured", async () => {
+      const configHome = await makeConfigHome({ permission: {} });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+      expect(prepared.runtimeDiagnostics).toEqual({});
+      await prepared.cleanup();
+    });
+  });
 });

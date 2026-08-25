@@ -133,6 +133,16 @@ Notes:
 - Paperclip requires an explicit \`model\` value for \`opencode_local\` agents.
 - Runs are executed with: opencode run --format json ...
 - Sessions are resumed with --session when stored session cwd matches current cwd.
+- Bounded session rotation: after \`sessionRotation.maxResumes\` consecutive \
+  resumes (default 4, env override PAPERCLIP_OPENCODE_SESSION_ROTATION_MAX_RESUMES, \
+  <=0 disables) the next run starts a compact fresh session; continuity is kept \
+  via the structured wake context instead of replaying stale conversation history.
+- MCP tool surface: configure \`toolSurface.mcpAllowlist\` / \
+  \`toolSurface.mcpDenylist\` (or env PAPERCLIP_OPENCODE_MCP_ALLOWLIST / \
+  PAPERCLIP_OPENCODE_MCP_DENYLIST) to keep only the servers a task needs; \
+  duplicate server definitions collapse to one canonical entry while a filter \
+  is active. Every run reports BEFORE/AFTER server names under the invocation \
+  meta \`runtimeDiagnostics.mcp.serverNames\`.
 - The adapter sets OPENCODE_DISABLE_PROJECT_CONFIG=true to prevent OpenCode from \
   writing an opencode.json config file into the project working directory. Model \
   selection is passed via the --model CLI flag instead.
