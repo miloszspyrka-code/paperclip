@@ -218,6 +218,8 @@ function durationMs(startedAt, finishedAt) {
 }
 
 function heartbeatRunSummary(run, observability = { supported: null, reason: "observability support unverified beyond the correlation window" }) {
+  const usage = persistedUsageProjection(run);
+  const hasPersistedUsage = [usage.inputTokens, usage.cachedInputTokens, usage.outputTokens, usage.totalTokens].some((value) => value !== null);
   return {
     runId: run.runId || run.id,
     issueId: run.issueId || run.contextSnapshot?.issueId || null,
@@ -230,6 +232,16 @@ function heartbeatRunSummary(run, observability = { supported: null, reason: "ob
     durationMs: durationMs(run.startedAt || run.createdAt, run.finishedAt),
     supportedObservability: observability.supported,
     reason: observability.reason,
+    usage: hasPersistedUsage
+      ? {
+          inputTokens: usage.inputTokens,
+          cachedInputTokens: usage.cachedInputTokens,
+          outputTokens: usage.outputTokens,
+          totalTokens: usage.totalTokens,
+        }
+      : null,
+    provider: usage.provider,
+    model: usage.model,
   };
 }
 
@@ -268,6 +280,43 @@ function heartbeatObservability(run, events) {
   };
 }
 
+// Token telemetry is projected verbatim from persisted heartbeat run data
+// (usage_json / result_json). Nothing is estimated or derived: reasoningTokens
+// surfaces only when the runtime stored it as its own value, and totalTokens
+// sums exclusively disjoint persisted buckets - never output tokens alongside
+// a separate reasoning bucket they may already fold in.
+function asPlainRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function persistedUsageProjection(run) {
+  const usage = asPlainRecord(run?.usageJson);
+  const result = asPlainRecord(run?.resultJson);
+  const numberOrNull = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
+  const textOrNull = (value) => {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+  };
+  const inputTokens = numberOrNull(usage.inputTokens);
+  const cachedInputTokens = numberOrNull(usage.cachedInputTokens);
+  const outputTokens = numberOrNull(usage.outputTokens);
+  const reasoningTokens = numberOrNull(usage.reasoningTokens);
+  const disjointBuckets = [inputTokens, cachedInputTokens];
+  if (reasoningTokens === null && outputTokens !== null) disjointBuckets.push(outputTokens);
+  const persistedBuckets = disjointBuckets.filter((value) => value !== null);
+  return {
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningTokens,
+    totalTokens: persistedBuckets.length > 0 ? persistedBuckets.reduce((total, value) => total + value, 0) : null,
+    usageMeasurement: textOrNull(result.usageMeasurement),
+    provider: textOrNull(usage.provider),
+    model: textOrNull(usage.model),
+  };
+}
+
 function normalizeHeartbeatEvent(event) {
   // Persisted heartbeat events are authoritative. Do not infer tool calls from
   // LLM text; only expose fields the runtime explicitly recorded.
@@ -302,6 +351,9 @@ function heartbeatMetrics(run, events) {
     timeToFirstWriteMs: null,
     timeToFirstTestMs: null,
     durationMs: durationMs(run.startedAt || run.createdAt, run.finishedAt),
+    // Persisted token usage is independent of supportedObservability, which
+    // keeps meaning structured TOOL telemetry only.
+    ...persistedUsageProjection(run),
   };
 }
 

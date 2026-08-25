@@ -141,13 +141,22 @@ test("public gateway routes skill modes through JSON-RPC and persists rotated re
     if (message.method === "tools/list") result = { tools: [] };
     else if (message.params?.name === "paperclipGetIssue") result = { structuredContent: { id: message.params.arguments.issueId, companyId: "11111111-1111-1111-1111-111111111111" } };
     else if (message.params?.name === "paperclipListHeartbeatRunsForIssue") result = { structuredContent: [
-      { runId: "33333333-3333-3333-3333-333333333333", contextSnapshot: { issueId: "issue-1" }, adapterType: "opencode_local", status: "completed", startedAt: "2026-08-23T10:00:00.000Z", finishedAt: "2026-08-23T10:00:03.000Z" },
-      { runId: "44444444-4444-4444-4444-444444444444", contextSnapshot: { issueId: "issue-1" }, adapterType: "opencode_local", status: "completed", startedAt: "2026-08-23T09:00:00.000Z", finishedAt: "2026-08-23T09:00:02.000Z" },
+      { runId: "33333333-3333-3333-3333-333333333333", contextSnapshot: { issueId: "issue-1" }, adapterType: "opencode_local", status: "completed", startedAt: "2026-08-23T10:00:00.000Z", finishedAt: "2026-08-23T10:00:03.000Z", usageJson: { inputTokens: 1200, cachedInputTokens: 300, outputTokens: 450, billingType: "workspace", costUsd: 0.012 } },
+      { runId: "44444444-4444-4444-4444-444444444444", contextSnapshot: { issueId: "issue-1" }, adapterType: "opencode_local", status: "completed", startedAt: "2026-08-23T09:00:00.000Z", finishedAt: "2026-08-23T09:00:02.000Z", usageJson: { inputTokens: 100, outputTokens: 50 } },
+      { runId: "55555555-5555-5555-5555-555555555555", contextSnapshot: { issueId: "issue-1" }, adapterType: "opencode_local", status: "failed", startedAt: "2026-08-23T08:00:00.000Z", finishedAt: "2026-08-23T08:00:01.000Z" },
     ] };
-    else if (message.params?.name === "paperclipGetHeartbeatRun") result = { structuredContent: message.params.arguments.runId === "44444444-4444-4444-4444-444444444444"
-      ? { id: message.params.arguments.runId, companyId: "11111111-1111-1111-1111-111111111111", adapterType: "opencode_local", status: "completed", startedAt: "2026-08-23T09:00:00.000Z", finishedAt: "2026-08-23T09:00:02.000Z" }
-      : { id: message.params.arguments.runId, companyId: "11111111-1111-1111-1111-111111111111", adapterType: "opencode_local", status: "completed", startedAt: "2026-08-23T10:00:00.000Z", finishedAt: "2026-08-23T10:00:03.000Z" } };
-    else if (message.params?.name === "paperclipListHeartbeatRunEvents") result = { structuredContent: message.params.arguments.runId === "44444444-4444-4444-4444-444444444444"
+    else if (message.params?.name === "paperclipGetHeartbeatRun") {
+      const heartbeatRunId = message.params.arguments.runId;
+      const baseRun = { id: heartbeatRunId, companyId: "11111111-1111-1111-1111-111111111111", adapterType: "opencode_local", status: "completed" };
+      if (heartbeatRunId === "33333333-3333-3333-3333-333333333333") {
+        result = { structuredContent: { ...baseRun, startedAt: "2026-08-23T10:00:00.000Z", finishedAt: "2026-08-23T10:00:03.000Z", usageJson: { inputTokens: 1200, cachedInputTokens: 300, outputTokens: 450, provider: "opencode-go", model: "ox-alpha-free", biller: "workspace", costUsd: 0.012 }, resultJson: { stdout: "", stderr: "", usageMeasurement: "exact" } } };
+      } else if (heartbeatRunId === "44444444-4444-4444-4444-444444444444") {
+        result = { structuredContent: { ...baseRun, startedAt: "2026-08-23T09:00:00.000Z", finishedAt: "2026-08-23T09:00:02.000Z", usageJson: { inputTokens: 100, outputTokens: 50 } } };
+      } else {
+        result = { structuredContent: { ...baseRun, status: "failed", startedAt: "2026-08-23T08:00:00.000Z", finishedAt: "2026-08-23T08:00:01.000Z" } };
+      }
+    }
+    else if (message.params?.name === "paperclipListHeartbeatRunEvents") result = { structuredContent: ["44444444-4444-4444-4444-444444444444", "55555555-5555-5555-5555-555555555555"].includes(message.params.arguments.runId)
       ? [{ seq: 1, eventType: "lifecycle", message: "run started", payload: null, createdAt: "2026-08-23T09:00:00.500Z" }]
       : [{ seq: 1, eventType: "tool", message: "persisted", payload: { toolName: "read", status: "success", durationMs: 12 }, createdAt: "2026-08-23T10:00:01.000Z" }, { seq: 2, eventType: "tool", message: "persisted", payload: { toolName: "test", status: "success" }, createdAt: "2026-08-23T10:00:02.000Z" }] };
     else result = { protocolVersion: "2025-03-26", capabilities: {} };
@@ -189,22 +198,49 @@ test("public gateway routes skill modes through JSON-RPC and persists rotated re
   const runSummaries = runs.json.result.structuredContent.runs.filter((run) => run.runKind === "heartbeat");
   const telemetryRun = runSummaries.find((run) => run.runId === "33333333-3333-3333-3333-333333333333");
   const lifecycleOnlyRun = runSummaries.find((run) => run.runId === "44444444-4444-4444-4444-444444444444");
+  const usagelessRun = runSummaries.find((run) => run.runId === "55555555-5555-5555-5555-555555555555");
   assert.equal(telemetryRun.supportedObservability, true);
   assert.equal(lifecycleOnlyRun.supportedObservability, false);
   assert.match(lifecycleOnlyRun.reason, /no structured tool telemetry/);
-  const events = await rpc(gateway.base, token.access_token, 25, "tools/call", { name: "paperclipGetRunEvents", arguments: { runId: "33333333-3333-3333-3333-333333333333" } }, session);
-  assert.deepEqual(events.json.result.structuredContent.events.map((event) => event.seq), [1, 2]);
-  assert.equal(events.json.result.structuredContent.supportedObservability, telemetryRun.supportedObservability);
+  assert.deepEqual(telemetryRun.usage, { inputTokens: 1200, cachedInputTokens: 300, outputTokens: 450, totalTokens: 1950 });
+  assert.deepEqual(lifecycleOnlyRun.usage, { inputTokens: 100, cachedInputTokens: null, outputTokens: 50, totalTokens: 150 });
+  assert.equal(usagelessRun.usage, null);
+  assert.equal(telemetryRun.provider, null);
+  assert.equal(telemetryRun.model, null);
   const metrics = await rpc(gateway.base, token.access_token, 26, "tools/call", { name: "paperclipGetRunMetrics", arguments: { runId: "33333333-3333-3333-3333-333333333333" } }, session);
   assert.equal(metrics.json.result.structuredContent.toolCalls, 2);
   assert.equal(metrics.json.result.structuredContent.testCalls, 1);
   assert.equal(metrics.json.result.structuredContent.supportedObservability, telemetryRun.supportedObservability);
+  assert.equal(metrics.json.result.structuredContent.inputTokens, 1200);
+  assert.equal(metrics.json.result.structuredContent.cachedInputTokens, 300);
+  assert.equal(metrics.json.result.structuredContent.outputTokens, 450);
+  assert.equal(metrics.json.result.structuredContent.reasoningTokens, null);
+  assert.equal(metrics.json.result.structuredContent.totalTokens, 1950);
+  assert.equal(metrics.json.result.structuredContent.provider, "opencode-go");
+  assert.equal(metrics.json.result.structuredContent.model, "ox-alpha-free");
+  assert.equal(metrics.json.result.structuredContent.usageMeasurement, "exact");
+  const events = await rpc(gateway.base, token.access_token, 25, "tools/call", { name: "paperclipGetRunEvents", arguments: { runId: "33333333-3333-3333-3333-333333333333" } }, session);
+  assert.deepEqual(events.json.result.structuredContent.events.map((event) => event.seq), [1, 2]);
+  assert.equal(events.json.result.structuredContent.supportedObservability, telemetryRun.supportedObservability);
   const lifecycleEvents = await rpc(gateway.base, token.access_token, 27, "tools/call", { name: "paperclipGetRunEvents", arguments: { runId: "44444444-4444-4444-4444-444444444444" } }, session);
   assert.equal(lifecycleEvents.status, 200);
   assert.equal(lifecycleEvents.json.result.structuredContent.supportedObservability, false);
   const lifecycleMetrics = await rpc(gateway.base, token.access_token, 28, "tools/call", { name: "paperclipGetRunMetrics", arguments: { runId: "44444444-4444-4444-4444-444444444444" } }, session);
   assert.equal(lifecycleMetrics.json.result.structuredContent.supportedObservability, false);
   assert.equal(lifecycleMetrics.json.result.structuredContent.toolCalls, null);
+  assert.equal(lifecycleMetrics.json.result.structuredContent.inputTokens, 100);
+  assert.equal(lifecycleMetrics.json.result.structuredContent.cachedInputTokens, null);
+  assert.equal(lifecycleMetrics.json.result.structuredContent.outputTokens, 50);
+  assert.equal(lifecycleMetrics.json.result.structuredContent.reasoningTokens, null);
+  assert.equal(lifecycleMetrics.json.result.structuredContent.totalTokens, 150);
+  assert.equal(lifecycleMetrics.json.result.structuredContent.provider, null);
+  assert.equal(lifecycleMetrics.json.result.structuredContent.model, null);
+  assert.equal(lifecycleMetrics.json.result.structuredContent.usageMeasurement, null);
+  const usagelessMetrics = await rpc(gateway.base, token.access_token, 29, "tools/call", { name: "paperclipGetRunMetrics", arguments: { runId: "55555555-5555-5555-5555-555555555555" } }, session);
+  assert.equal(usagelessMetrics.status, 200);
+  for (const field of ["inputTokens", "cachedInputTokens", "outputTokens", "reasoningTokens", "totalTokens", "provider", "model", "usageMeasurement"]) {
+    assert.equal(usagelessMetrics.json.result.structuredContent[field], null, `${field} must stay null without persisted usage`);
+  }
   const upstreamFailure = await rpc(gateway.base, token.access_token, 22, "tools/call", { name: "paperclipMe", arguments: {} }, session);
   assert.equal(upstreamFailure.status, 503);
 
