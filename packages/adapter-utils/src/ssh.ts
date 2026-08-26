@@ -1716,19 +1716,51 @@ export async function readSshEnvLabFixtureState(
   }
 }
 
-export async function stopSshEnvLabFixture(statePath: string): Promise<boolean> {
-  const state = await readSshEnvLabFixtureState(statePath);
+async function waitUntilFixtureProcessExits(
+  state: Pick<SshEnvLabFixtureState, "pid" | "sshdConfigPath">,
+  timeoutMs: number,
+  intervalMs = 100,
+): Promise<boolean> {
+  const timeoutAt = Date.now() + timeoutMs;
+  while (true) {
+    if (!(await isSshEnvLabFixtureProcess(state))) return true;
+    if (Date.now() >= timeoutAt) return false;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
+// Accepts a state path or an already-read state so a caller that already
+// holds the fixture state in memory does not have to depend on the state
+// file, which a teardown step may have already removed.
+export async function stopSshEnvLabFixture(
+  stateOrPath: string | SshEnvLabFixtureState,
+): Promise<boolean> {
+  const state = typeof stateOrPath === "string"
+    ? await readSshEnvLabFixtureState(stateOrPath)
+    : stateOrPath;
   if (!state) return false;
 
   if (await isSshEnvLabFixtureProcess(state)) {
     process.kill(state.pid, "SIGTERM");
-    await waitForCondition(async () => {
+    if (!(await waitUntilFixtureProcessExits(state, 5_000))) {
+      // Re-check identity immediately before SIGKILL: the pid can be reused
+      // in the gap between the two signals.
       if (await isSshEnvLabFixtureProcess(state)) {
-        throw new Error("SSH fixture process is still running.");
+        process.kill(state.pid, "SIGKILL");
+        if (!(await waitUntilFixtureProcessExits(state, 2_000))) {
+          if (await isSshEnvLabFixtureProcess(state)) {
+            throw new Error(
+              `SSH env-lab fixture did not stop: pid ${state.pid} on port ${state.port} is still running after SIGKILL.`,
+            );
+          }
+        }
       }
-    }, { timeoutMs: 5_000, intervalMs: 100 });
+    }
   }
 
+  // Remove the root directory only after the listener process is confirmed
+  // gone. Removing it earlier would delete the state file the process needs
+  // for a later stop attempt to find and signal it.
   await fs.rm(state.rootDir, { recursive: true, force: true }).catch(() => undefined);
   return true;
 }
