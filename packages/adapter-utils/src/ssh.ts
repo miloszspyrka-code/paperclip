@@ -1729,6 +1729,25 @@ async function waitUntilFixtureProcessExits(
   }
 }
 
+// Sends a signal to a pid and treats an already-dead process as success.
+// The identity check that runs before this call is not free: it spawns
+// `ps`, which opens a real gap between the check and the signal. If the
+// process exits inside that gap, `process.kill` throws ESRCH even though
+// the outcome the caller wants (the process is gone) already holds. Any
+// other error, such as EPERM for a pid that belongs to another user, must
+// still propagate.
+function signalFixtureProcess(pid: number, signal: NodeJS.Signals): boolean {
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ESRCH") {
+      return false;
+    }
+    throw error;
+  }
+}
+
 // Bounded shutdown escalation shared by every caller that must stop a
 // fixture process: send SIGTERM, wait, re-check process identity (the pid
 // can be reused in the gap between two signals), then SIGKILL, then wait
@@ -1738,11 +1757,11 @@ async function escalateSshEnvLabFixtureShutdown(
 ): Promise<boolean> {
   if (!(await isSshEnvLabFixtureProcess(state))) return true;
 
-  process.kill(state.pid, "SIGTERM");
+  if (!signalFixtureProcess(state.pid, "SIGTERM")) return true;
   if (await waitUntilFixtureProcessExits(state, 5_000)) return true;
 
   if (!(await isSshEnvLabFixtureProcess(state))) return true;
-  process.kill(state.pid, "SIGKILL");
+  if (!signalFixtureProcess(state.pid, "SIGKILL")) return true;
   if (await waitUntilFixtureProcessExits(state, 2_000)) return true;
 
   return !(await isSshEnvLabFixtureProcess(state));
