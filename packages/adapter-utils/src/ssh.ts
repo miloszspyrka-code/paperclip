@@ -1729,6 +1729,25 @@ async function waitUntilFixtureProcessExits(
   }
 }
 
+// Bounded shutdown escalation shared by every caller that must stop a
+// fixture process: send SIGTERM, wait, re-check process identity (the pid
+// can be reused in the gap between two signals), then SIGKILL, then wait
+// again. Returns true only when the listener is confirmed gone.
+async function escalateSshEnvLabFixtureShutdown(
+  state: Pick<SshEnvLabFixtureState, "pid" | "sshdConfigPath">,
+): Promise<boolean> {
+  if (!(await isSshEnvLabFixtureProcess(state))) return true;
+
+  process.kill(state.pid, "SIGTERM");
+  if (await waitUntilFixtureProcessExits(state, 5_000)) return true;
+
+  if (!(await isSshEnvLabFixtureProcess(state))) return true;
+  process.kill(state.pid, "SIGKILL");
+  if (await waitUntilFixtureProcessExits(state, 2_000)) return true;
+
+  return !(await isSshEnvLabFixtureProcess(state));
+}
+
 // Accepts a state path or an already-read state so a caller that already
 // holds the fixture state in memory does not have to depend on the state
 // file, which a teardown step may have already removed.
@@ -1740,22 +1759,10 @@ export async function stopSshEnvLabFixture(
     : stateOrPath;
   if (!state) return false;
 
-  if (await isSshEnvLabFixtureProcess(state)) {
-    process.kill(state.pid, "SIGTERM");
-    if (!(await waitUntilFixtureProcessExits(state, 5_000))) {
-      // Re-check identity immediately before SIGKILL: the pid can be reused
-      // in the gap between the two signals.
-      if (await isSshEnvLabFixtureProcess(state)) {
-        process.kill(state.pid, "SIGKILL");
-        if (!(await waitUntilFixtureProcessExits(state, 2_000))) {
-          if (await isSshEnvLabFixtureProcess(state)) {
-            throw new Error(
-              `SSH env-lab fixture did not stop: pid ${state.pid} on port ${state.port} is still running after SIGKILL.`,
-            );
-          }
-        }
-      }
-    }
+  if (!(await escalateSshEnvLabFixtureShutdown(state))) {
+    throw new Error(
+      `SSH env-lab fixture did not stop: pid ${state.pid} on port ${state.port} is still running after SIGKILL.`,
+    );
   }
 
   // Remove the root directory only after the listener process is confirmed
@@ -1769,6 +1776,10 @@ export async function startSshEnvLabFixture(input: {
   statePath: string;
   bindHost?: string;
   host?: string;
+  // Test-only. Shortens the readiness wait below its 10 second default, so
+  // a regression test can force the start-failure cleanup path without a
+  // real 10 second wait.
+  readinessTimeoutMs?: number;
 }): Promise<SshEnvLabFixtureState> {
   const existing = await readSshEnvLabFixtureState(input.statePath);
   if (existing && await isSshEnvLabFixtureProcess(existing)) {
@@ -1886,14 +1897,28 @@ export async function startSshEnvLabFixture(input: {
       }
       const config = await buildSshEnvLabFixtureConfig(state);
       await ensureSshWorkspaceReady(config);
-    }, { timeoutMs: 10_000, intervalMs: 250 });
+    }, { timeoutMs: input.readinessTimeoutMs ?? 10_000, intervalMs: 250 });
     await fs.writeFile(input.statePath, JSON.stringify(state, null, 2), { mode: 0o600 });
     return state;
   } catch (error) {
-    if (await isPidRunning(state.pid)) {
-      process.kill(state.pid, "SIGTERM");
+    // No state file exists on this path yet, so a later stopSshEnvLabFixture
+    // call can never find this pid. Escalate and wait for exit here, the
+    // same way stopSshEnvLabFixture does, before the root directory goes
+    // away — otherwise a slow-to-exit sshd survives as an orphan with its
+    // root directory already gone.
+    const stopped = await escalateSshEnvLabFixtureShutdown(state);
+    if (stopped) {
+      await fs.rm(rootDir, { recursive: true, force: true }).catch(() => undefined);
+    } else {
+      const survivalNote =
+        `SSH env-lab fixture pid ${state.pid} on port ${state.port} is still running after SIGKILL. ` +
+        `Kept ${rootDir} for inspection; no state file exists to target it with a later stop call.`;
+      if (error instanceof Error) {
+        error.message = `${error.message}\n${survivalNote}`;
+      } else {
+        console.error(survivalNote);
+      }
     }
-    await fs.rm(rootDir, { recursive: true, force: true }).catch(() => undefined);
     throw error;
   }
 }

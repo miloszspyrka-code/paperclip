@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -23,11 +23,12 @@ import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 30_000;
 let sshEnvLabUnsupportedReason: string | null = null;
 
-// One entry per fixture-start attempt, registered at start time so teardown
-// survives an assertion failure, a thrown error, or an early return on skip.
-// `state` stays null until the fixture actually starts; a caller that stops
-// the fixture itself still leaves the entry in the stack, so the drain below
-// must be idempotent (stopSshEnvLabFixture is).
+// One entry per fixture root directory, registered at creation time so
+// teardown survives a setup call that throws before the fixture starts, an
+// assertion failure, or an early return on skip. `state` stays null until
+// the fixture actually starts; a caller that stops the fixture itself still
+// leaves the entry in the stack, so the drain below must be idempotent
+// (stopSshEnvLabFixture is).
 interface FixtureTeardownEntry {
   rootDir: string;
   state: SshEnvLabFixtureState | null;
@@ -35,12 +36,36 @@ interface FixtureTeardownEntry {
 
 const fixtureTeardowns: FixtureTeardownEntry[] = [];
 
+// Creates the fixture root directory and registers its teardown entry in
+// the same step, so a setup call that throws between here and the fixture
+// start (mkdir, writeFile, git init) still leaves the root directory queued
+// for removal.
+async function createFixtureRootDir(): Promise<string> {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+  fixtureTeardowns.push({ rootDir, state: null });
+  return rootDir;
+}
+
 async function drainFixtureTeardowns(): Promise<void> {
   while (fixtureTeardowns.length > 0) {
     const entry = fixtureTeardowns.pop();
     if (!entry) continue;
     if (entry.state) {
-      await stopSshEnvLabFixture(entry.state).catch(() => undefined);
+      try {
+        await stopSshEnvLabFixture(entry.state);
+      } catch (error) {
+        // stopSshEnvLabFixture throws only when the listener survives
+        // SIGKILL, and it deliberately keeps the root directory so a later
+        // stop call can still find and signal it through the state file.
+        // Report the failure but keep the root directory; do not remove it,
+        // and do not rethrow, so a throw here cannot strand the entries
+        // still left on the stack.
+        console.error(
+          `SSH env-lab fixture teardown failed for pid ${entry.state.pid} on port ${entry.state.port}:`,
+          error,
+        );
+        continue;
+      }
     }
     await rm(entry.rootDir, { recursive: true, force: true }).catch(() => undefined);
   }
@@ -58,12 +83,39 @@ async function git(cwd: string, args: string[]): Promise<string> {
   });
 }
 
+// Finds the pid of a running sshd process by its config file path, the same
+// way isSshEnvLabFixtureProcess identifies a fixture internally. Used by the
+// readiness-failure regression test, which needs the pid of a fixture that
+// startSshEnvLabFixture never returns because it throws before returning it.
+async function findSshdPidByConfigPath(sshdConfigPath: string): Promise<number | null> {
+  const stdout = await new Promise<string>((resolve) => {
+    execFile("ps", ["-eo", "pid=,args="], (error, out) => resolve(error ? "" : out));
+  });
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    const spaceIndex = trimmed.indexOf(" ");
+    if (spaceIndex === -1) continue;
+    const pid = Number.parseInt(trimmed.slice(0, spaceIndex), 10);
+    const args = trimmed.slice(spaceIndex + 1);
+    if (Number.isFinite(pid) && args.includes(sshdConfigPath)) {
+      return pid;
+    }
+  }
+  return null;
+}
+
 async function startSshEnvLabFixtureOrSkip(statePath: string, label: string) {
-  // Register the teardown entry before the first await, so a fixture that
-  // starts and then throws later in the calling test still gets its root
-  // directory removed.
-  const entry: FixtureTeardownEntry = { rootDir: path.dirname(statePath), state: null };
-  fixtureTeardowns.push(entry);
+  // The teardown entry for this root directory must already exist: callers
+  // create it with createFixtureRootDir() before they derive statePath, so
+  // this only attaches the state to that entry instead of pushing a new
+  // one (a root directory must never get two entries).
+  const rootDir = path.dirname(statePath);
+  const entry = fixtureTeardowns.find((candidate) => candidate.rootDir === rootDir);
+  if (!entry) {
+    throw new Error(
+      `No fixture teardown entry for ${rootDir}. Call createFixtureRootDir() before starting a fixture.`,
+    );
+  }
 
   if (sshEnvLabUnsupportedReason) {
     console.warn(`Skipping ${label}: ${sshEnvLabUnsupportedReason}`);
@@ -120,7 +172,7 @@ describe("ssh env-lab fixture", () => {
   afterAll(drainFixtureTeardowns);
 
   it("starts an isolated sshd fixture and executes commands through it", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
 
     const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH env-lab fixture test");
@@ -143,7 +195,7 @@ describe("ssh env-lab fixture", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("forwards stdin to remote SSH commands", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
 
     const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH stdin forwarding test");
@@ -171,7 +223,7 @@ describe("ssh env-lab fixture", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("does not treat an unrelated reused pid as the running fixture", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
 
     const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH env-lab fixture test");
@@ -196,7 +248,7 @@ describe("ssh env-lab fixture", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("stops the fixture listener and frees its loopback port", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
 
     const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH teardown regression test");
@@ -222,6 +274,60 @@ describe("ssh env-lab fixture", () => {
         probe.close((closeError) => (closeError ? reject(closeError) : resolve()));
       });
     });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("leaves no live listener and no root directory when the fixture fails readiness", async () => {
+    if (sshEnvLabUnsupportedReason) {
+      console.warn(`Skipping SSH readiness-failure cleanup test: ${sshEnvLabUnsupportedReason}`);
+      return;
+    }
+    const support = await getSshEnvLabSupport();
+    if (!support.supported) {
+      sshEnvLabUnsupportedReason = support.reason ?? "unsupported environment";
+      console.warn(`Skipping SSH readiness-failure cleanup test: ${sshEnvLabUnsupportedReason}`);
+      return;
+    }
+
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const sshdConfigPath = path.join(rootDir, "sshd_config");
+
+    // sshd binds through bindHost (127.0.0.1) and stays alive; the readiness
+    // check targets an unreachable RFC 5737 TEST-NET-3 address instead, so it
+    // fails on every attempt without ever reaching a real host. Poll for the
+    // resulting sshd process concurrently, since startSshEnvLabFixture never
+    // returns a state on this path (it throws before writing one).
+    let capturedPid: number | null = null;
+    const pollDeadline = Date.now() + 5_000;
+    const pollForPid = (async () => {
+      while (capturedPid === null && Date.now() < pollDeadline) {
+        capturedPid = await findSshdPidByConfigPath(sshdConfigPath);
+        if (capturedPid === null) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
+    })();
+
+    await expect(
+      startSshEnvLabFixture({
+        statePath,
+        host: "203.0.113.1",
+        readinessTimeoutMs: 1_000,
+      }),
+    ).rejects.toThrow();
+
+    await pollForPid;
+    expect(capturedPid).not.toBeNull();
+
+    let pidStillRunning = true;
+    try {
+      process.kill(capturedPid!, 0);
+    } catch {
+      pidStillRunning = false;
+    }
+    expect(pidStillRunning).toBe(false);
+
+    await expect(stat(rootDir)).rejects.toThrow();
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("builds a remote script that sources login profiles but no nvm", async () => {
@@ -290,7 +396,7 @@ describe("ssh env-lab fixture", () => {
   });
 
   it("syncs a local directory into the remote fixture workspace", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
     const localDir = path.join(rootDir, "local-overlay");
 
@@ -322,7 +428,7 @@ describe("ssh env-lab fixture", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("reports throttled upload progress with a clamped percent and terminal 100% line", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
     const localDir = path.join(rootDir, "local-overlay");
 
@@ -369,7 +475,7 @@ describe("ssh env-lab fixture", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("reports restore progress with a terminal completion line", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
     const localDir = path.join(rootDir, "local-overlay");
     const restoreDir = path.join(rootDir, "restore-target");
@@ -414,7 +520,7 @@ describe("ssh env-lab fixture", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("reports exact git-history import percentage from the known bundle size", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
     const localRepo = path.join(rootDir, "local-workspace");
 
@@ -455,7 +561,7 @@ describe("ssh env-lab fixture", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("can dereference local symlinks while syncing to the remote fixture", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
     const sourceDir = path.join(rootDir, "source");
     const localDir = path.join(rootDir, "local-overlay");
@@ -490,7 +596,7 @@ describe("ssh env-lab fixture", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("round-trips a git workspace through the SSH fixture", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
     const localRepo = path.join(rootDir, "local-workspace");
 
@@ -549,7 +655,7 @@ describe("ssh env-lab fixture", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("preserves both concurrent SSH restores in a shared git workspace", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
     const localRepo = path.join(rootDir, "local-workspace");
 
@@ -606,7 +712,7 @@ describe("ssh env-lab fixture", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("preserves nested per-run files across sequential SSH restores with stale baselines", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
     const localRepo = path.join(rootDir, "local-workspace");
 
@@ -661,7 +767,7 @@ describe("ssh env-lab fixture", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("round-trips remote git commits through the managed runtime restore path", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
     const localRepo = path.join(rootDir, "local-workspace");
 
@@ -706,7 +812,7 @@ describe("ssh env-lab fixture", () => {
     // packages/adapter-utils/README.md and packages/adapters/AUTHORING.md:
     // the local execution-workspace cwd is the only persistence boundary
     // across runs. No adapter may depend on a git remote for cross-run state.
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
     const localRepo = path.join(rootDir, "local-workspace");
 
@@ -763,7 +869,7 @@ describe("ssh env-lab fixture", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("merges concurrent remote commits through the managed runtime restore path", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
     const localRepo = path.join(rootDir, "local-workspace");
 
