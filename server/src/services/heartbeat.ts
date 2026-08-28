@@ -16263,6 +16263,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
         } else {
           const adapterContext = { ...context };
+          adapterContext.agentRole = agent.role;
           const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
             db,
             agent,
@@ -16540,6 +16541,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               resultJson: {
                 ...parseObject(adapterResult.resultJson),
                 configFreshness: configFreshnessResultMetadata,
+                ...(adapterResult.runTelemetry ? { runTelemetry: adapterResult.runTelemetry } : {}),
               },
               errorFamily: adapterResult.errorFamily ?? null,
               retryNotBefore: adapterResult.retryNotBefore ?? null,

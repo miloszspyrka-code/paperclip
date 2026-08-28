@@ -562,6 +562,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? ""
       : renderTemplate(promptTemplate, templateData);
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+
+    // Runtime context narrowing: for technical roles (engineer, cto, security,
+    // devops), strip unrelated UI/branding context from the prompt unless the
+    // task explicitly scopes it. This prevents Playwright/Storybook/Cloudflare
+    // context from polluting code-focused inference.
+    const agentRole = asString(context.agentRole, "").toLowerCase();
+    const isTechnicalRole = ["engineer", "cto", "security", "devops", "general"].includes(agentRole);
+    const taskScopedTools = asString(context.taskScopedTools, "");
+    const hasExplicitToolScope = taskScopedTools.length > 0;
+
     const prompt = joinPromptSections([
       instructionsPrefix,
       renderedBootstrapPrompt,
@@ -576,6 +586,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       wakePromptChars: wakePrompt.length,
       sessionHandoffChars: sessionHandoffNote.length,
       heartbeatPromptChars: renderedPrompt.length,
+      taskContextChars: wakePrompt.length + sessionHandoffNote.length,
+      runtimeContextNarrowed: isTechnicalRole && !hasExplicitToolScope,
     };
 
     // Optional diagnostic: surface OpenCode's own logs on stderr (captured into the
@@ -705,6 +717,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         },
         summary: attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
+        runTelemetry: attempt.parsed.telemetry
+          ? {
+              toolCalls: attempt.parsed.telemetry.toolCalls,
+              failedToolCalls: attempt.parsed.telemetry.failedToolCalls,
+              retryCount: attempt.parsed.telemetry.retryCount,
+              searchCalls: attempt.parsed.telemetry.searchCalls,
+              fileReads: attempt.parsed.telemetry.fileReads,
+              fileWrites: attempt.parsed.telemetry.fileWrites,
+              testCalls: attempt.parsed.telemetry.testCalls,
+              timeToFirstWriteMs: attempt.parsed.telemetry.timeToFirstWriteMs,
+              timeToFirstTestMs: attempt.parsed.telemetry.timeToFirstTestMs,
+            }
+          : null,
       };
     };
 

@@ -65,6 +65,32 @@ export interface AdapterRuntimeServiceReport {
   healthStatus?: "unknown" | "healthy" | "unhealthy";
 }
 
+/**
+ * Structured per-run telemetry counters derived from adapter output events.
+ * Persisted on the heartbeat run record for observability, budget
+ * classification, and compaction decisions.
+ */
+export interface AdapterRunTelemetry {
+  /** Total tool invocations observed in the run output. */
+  toolCalls: number;
+  /** Tool invocations that ended in error status. */
+  failedToolCalls: number;
+  /** Adapter-reported retry count (e.g. session unknown retry). */
+  retryCount: number;
+  /** Tool invocations classified as search/grep/glob/read. */
+  searchCalls: number;
+  /** Tool invocations classified as file read operations. */
+  fileReads: number;
+  /** Tool invocations classified as file write/edit operations. */
+  fileWrites: number;
+  /** Tool invocations classified as test execution. */
+  testCalls: number;
+  /** Wall-clock ms from first event to first file-write tool call. */
+  timeToFirstWriteMs: number | null;
+  /** Wall-clock ms from first event to first test tool call. */
+  timeToFirstTestMs: number | null;
+}
+
 export type AdapterExecutionErrorFamily =
   | "transient_upstream"
   | "provider_quota"
@@ -108,6 +134,13 @@ export interface AdapterExecutionResult {
    */
   cacheAdjustedCostUsd?: number | null;
   resultJson?: Record<string, unknown> | null;
+  /**
+   * Structured per-run telemetry derived from adapter output events. Adapters
+   * that parse structured stdout (e.g. OpenCode JSONL) populate this with
+   * deterministic counters and timestamps. The server persists these into the
+   * heartbeat run record for observability and budget classification.
+   */
+  runTelemetry?: AdapterRunTelemetry | null;
   runtimeServices?: AdapterRuntimeServiceReport[];
   /**
    * Each referenced (mentioned) project that failed to stage into the remote sandbox for this run,
@@ -144,7 +177,7 @@ export interface AdapterInvocationMeta {
   commandNotes?: string[];
   env?: Record<string, string>;
   prompt?: string;
-  promptMetrics?: Record<string, number>;
+  promptMetrics?: Record<string, number | boolean>;
   context?: Record<string, unknown>;
 }
 
