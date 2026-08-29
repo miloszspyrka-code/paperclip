@@ -74,6 +74,33 @@ export type AdapterExecutionErrorFamily =
   | "refresh_token_expired"
   | "refresh_token_invalidated";
 
+/**
+ * Structured per-run telemetry counters derived from adapter output events.
+ * Persisted on the heartbeat run record for observability, budget
+ * classification, and compaction decisions. Counters are computed deterministically
+ * from the adapter event stream (e.g. OpenCode JSONL); they are never estimated.
+ */
+export interface AdapterRunTelemetry {
+  /** Total tool invocations observed in the run output. */
+  toolCalls: number;
+  /** Tool invocations that ended in error status. */
+  failedToolCalls: number;
+  /** Adapter-reported retry count (e.g. session unknown retry). */
+  retryCount: number;
+  /** Tool invocations classified as search/grep/glob/read. */
+  searchCalls: number;
+  /** Tool invocations classified as file read operations. */
+  fileReads: number;
+  /** Tool invocations classified as file write/edit operations. */
+  fileWrites: number;
+  /** Tool invocations classified as test execution. */
+  testCalls: number;
+  /** Wall-clock ms from first event to first file-write tool call. */
+  timeToFirstWriteMs: number | null;
+  /** Wall-clock ms from first event to first test tool call. */
+  timeToFirstTestMs: number | null;
+}
+
 export interface AdapterExecutionResult {
   exitCode: number | null;
   signal: string | null;
@@ -120,6 +147,14 @@ export interface AdapterExecutionResult {
    */
   referencedProjectStagingFailures?: Array<{ projectId: string; error: string }>;
   summary?: string | null;
+  /**
+   * Structured per-run telemetry derived from adapter output events. Adapters
+   * that parse structured stdout (e.g. OpenCode JSONL) populate this with
+   * deterministic counters and timestamps; the server persists these into the
+   * heartbeat run record for observability and budget classification. Absent
+   * when the adapter does not emit structured telemetry events.
+   */
+  runTelemetry?: AdapterRunTelemetry | null;
   clearSession?: boolean;
   question?: {
     prompt: string;
