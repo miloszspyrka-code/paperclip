@@ -6693,6 +6693,57 @@ export function resolveNextSessionState(input: {
   };
 }
 
+/**
+ * Durable session checkpoint (KOMAA-126 / KOMAA-134): derive the minimal
+ * resumable session state from a freshly finished adapter result so it can be
+ * persisted BEFORE the large terminal heartbeat_runs write (result JSON /
+ * logs / usage). If that terminal write later fails, the canonical task
+ * session row still carries the discovered sessionId and the next logical
+ * resume reuses `--session` instead of silently paying a fresh bootstrap.
+ *
+ * Only an explicitly discovered session (explicit params or explicit id) is
+ * checkpointed; when the adapter reports none, the existing task-session row
+ * is left untouched. Mirrors the explicit-session branch of
+ * resolveNextSessionState, minus the outcome/previous-state fallbacks that
+ * must not resurrect stale sessions after a failed finalization.
+ */
+export function resolveDurableSessionCheckpoint(input: {
+  adapterType?: string | null;
+  codec: AdapterSessionCodec;
+  taskKey: string | null;
+  clearSession: boolean;
+  sessionId?: string | null;
+  sessionParams?: Record<string, unknown> | null;
+}) {
+  if (!input.taskKey || input.clearSession) return null;
+  const hasExplicitParams = input.sessionParams !== undefined && input.sessionParams !== null;
+  const explicitSessionId = readNonEmptyString(input.sessionId);
+  const candidateParams = hasExplicitParams
+    ? input.sessionParams!
+    : explicitSessionId
+      ? { sessionId: explicitSessionId }
+      : null;
+  if (!candidateParams) return null;
+  const serialized = normalizeSessionParams(
+    input.codec.serialize(normalizeSessionParams(candidateParams) ?? null),
+  );
+  if (!serialized) return null;
+  if (
+    requiresCanonicalSessionIds(input.adapterType) &&
+    normalizeResumeParamsForAdapter(input.adapterType, serialized) === null
+  ) {
+    return null;
+  }
+  const displayId = truncateDisplayId(
+    (input.codec.getDisplayId ? input.codec.getDisplayId(serialized) : null) ??
+      readNonEmptyString(serialized.sessionId),
+  );
+  return {
+    sessionParamsJson: serialized,
+    displayId,
+  };
+}
+
 export type HeartbeatEnvironmentRuntime = ReturnType<typeof environmentRuntimeService>;
 
 export interface HeartbeatServiceOptions {
@@ -15627,6 +15678,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       delete context.paperclipPreviousSessionId;
     }
 
+    // A resume-intent wake must never silently degrade into a fresh full
+    // bootstrap (KOMAA-134). If no resumable session survived — e.g. a
+    // persistence failure lost the canonical task-session row and no durable
+    // checkpoint recovered it — record an explicit fresh-fallback reason so
+    // the run evidence shows why a fresh bootstrap was allowed instead of
+    // hiding the regression behind an ordinary fresh session.
+    const resumeIntentRequested =
+      context.resumeIntent === true || context.followUpRequested === true;
+    if (
+      resumeIntentRequested &&
+      !runtimeSessionIdForAdapter &&
+      !runtimeSessionParamsForAdapter &&
+      !resetTaskSession &&
+      !sessionCompaction.rotate
+    ) {
+      context.paperclipResumeFreshFallback = {
+        code: "resume_session_unavailable",
+        requestedResumeSessionId: previousSessionDisplayId ?? null,
+      };
+      runtimeWorkspaceWarnings.push(
+        "Resume was requested but no resumable session is available; falling back to a fresh bootstrap (code=resume_session_unavailable).",
+      );
+    } else {
+      delete context.paperclipResumeFreshFallback;
+    }
+
     const runtimeForAdapter = {
       sessionId: runtimeSessionIdForAdapter,
       sessionParams: runtimeSessionParamsForAdapter,
@@ -16182,6 +16259,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
       try {
         const adapterContext = { ...context };
+        // Task-declared execution contract passthrough (KOMAA-126): a wake
+        // payload may declare the required model / execution surface; the
+        // opencode_local preflight fails the run before inference on mismatch.
+        const runContract = parseObject(
+          parseObject(context[PAPERCLIP_WAKE_PAYLOAD_KEY]).runContract,
+        );
+        if (Object.keys(runContract).length > 0) {
+          adapterContext.paperclipRunContract = runContract;
+        }
         const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
           db,
           agent,
@@ -16269,6 +16355,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           logger.warn(
             { err: revokeErr, runId: run.id, companyId: agent.companyId },
             "failed to revoke heartbeat-run MCP gateway tokens",
+          );
+        }
+      }
+      // Durable session checkpoint BEFORE terminal bookkeeping (KOMAA-126):
+      // persist the freshly discovered adapter session ahead of the large
+      // heartbeat_runs finalize write. If that write fails (KOMAA-134), the
+      // canonical task session still carries the sessionId so the next
+      // logical resume reuses --session instead of a fresh full bootstrap.
+      const durableSessionCheckpoint = resolveDurableSessionCheckpoint({
+        adapterType: agent.adapterType,
+        codec: sessionCodec,
+        taskKey,
+        clearSession: adapterResult.clearSession === true,
+        sessionId: adapterResult.sessionId,
+        sessionParams: adapterResult.sessionParams,
+      });
+      if (durableSessionCheckpoint) {
+        try {
+          await upsertTaskSession({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            adapterType: agent.adapterType,
+            taskKey: taskKey!,
+            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+              durableSessionCheckpoint.sessionParamsJson,
+              configuredModel,
+              sessionConfigMetadata,
+            ),
+            sessionDisplayId: durableSessionCheckpoint.displayId,
+            lastRunId: run.id,
+            lastError: null,
+          });
+        } catch (checkpointErr) {
+          logger.warn(
+            { err: checkpointErr, runId: run.id, issueId },
+            "failed to write the durable adapter session checkpoint",
           );
         }
       }

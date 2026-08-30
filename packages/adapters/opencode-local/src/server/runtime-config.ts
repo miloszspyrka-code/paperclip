@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
+import { asBoolean, parseObject } from "@paperclipai/adapter-utils/server-utils";
 
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
@@ -24,6 +24,30 @@ export interface OpenCodeRuntimeDiagnostics {
     removedByAllowlist: string[];
     removedByDenylist: string[];
     removedAsAliases: string[];
+    /**
+     * Eager-minimal task scope (KOMAA-126): the servers that actually load
+     * BEFORE inference for this task. Whens a task declares an `mcpScope` the
+     * runtime eagerly loads only those servers and DEFERS every irrelevant one,
+     * so the model never pays for an unrelated tool surface at bootstrap.
+     */
+    eagerServerNames: string[];
+    /**
+     * Servers deferred from BEFORE-inference load because they are outside the
+     * task-declared `mcpScope`. They stay absent from the enabled surface until
+     * the task explicitly needs them (progressive disclosure), not silently
+     * dropped forever.
+     */
+    deferredIrrelevant: string[];
+  };
+  /**
+   * Resolved execution-surface facts for the deterministic run preflight
+   * (KOMAA-126): whether host/global project config is disabled for the
+   * managed runtime and how many host plugin files were inherited into the
+   * runtime config snapshot.
+   */
+  executionSurface?: {
+    projectConfigDisabled: boolean;
+    inheritedPluginCount: number;
   };
 }
 
@@ -254,10 +278,83 @@ export function applyOpenCodeMcpToolSurface(
   return result;
 }
 
+/**
+ * Eager-minimal task scope (KOMAA-126): a task may declare the subset of MCP
+ * servers relevant to it. When it does, only those servers load BEFORE
+ * inference and every other configured server is deferred (progressive
+ * disclosure) instead of padding the bootstrap tool surface. Absent scope =
+ * unchanged behavior (all configured servers load eagerly).
+ *
+ * Resolution priority: task-declared `wake.mcpScope` (per-run, most specific)
+ * > agent config `toolSurface.mcpScope` > env `PAPERCLIP_OPENCODE_EAGER_MCP_SCOPE`.
+ */
+export interface OpenCodeEagerMcpScope {
+  relevantServerKeys: ReadonlySet<string> | null;
+  active: boolean;
+}
+
+export function resolveOpenCodeEagerMcpScope(input: {
+  config: Record<string, unknown>;
+  env: Record<string, string | undefined>;
+  wake?: unknown;
+}): OpenCodeEagerMcpScope {
+  const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
+  const wakeScope = parseNameList(parseObject(input.wake).mcpScope);
+  const rawToolSurface = isPlainObject(input.config.toolSurface) ? input.config.toolSurface : {};
+  const configScope = parseNameList(rawToolSurface.mcpScope);
+  const envScope = parseNameList(resolveEnv("PAPERCLIP_OPENCODE_EAGER_MCP_SCOPE"));
+  const scope = wakeScope ?? configScope ?? envScope;
+  if (!scope) return { relevantServerKeys: null, active: false };
+  return { relevantServerKeys: new Set(scope), active: true };
+}
+
+export interface AppliedOpenCodeEagerMcpResult {
+  /** Filtered map to write into the runtime config (null = no change). */
+  next: Record<string, unknown> | null;
+  /** Servers that load before inference under the eager scope. */
+  eagerServerNames: string[];
+  /** Configured servers deferred from before-inference load. */
+  deferredIrrelevant: string[];
+}
+
+/**
+ * Apply the eager-minimal task scope to an `mcp` map: keep only the servers in
+ * the relevant set; record the rest as deferred. Pure and deterministic so the
+ * deferred set is both testable and reproducible across runs.
+ */
+export function applyOpenCodeEagerMinimalMcpSurface(
+  mcp: unknown,
+  scope: OpenCodeEagerMcpScope,
+): AppliedOpenCodeEagerMcpResult {
+  const empty: AppliedOpenCodeEagerMcpResult = {
+    next: null,
+    eagerServerNames: [],
+    deferredIrrelevant: [],
+  };
+  if (!isPlainObject(mcp)) return empty;
+  const entries = Object.entries(mcp).filter(([, value]) => value !== null && value !== undefined);
+  if (!scope.active || scope.relevantServerKeys === null) {
+    return {
+      next: null,
+      eagerServerNames: entries.map(([key]) => key),
+      deferredIrrelevant: [],
+    };
+  }
+  const kept = entries.filter(([key]) => scope.relevantServerKeys!.has(key));
+  const deferred = entries.filter(([key]) => !scope.relevantServerKeys!.has(key)).map(([key]) => key);
+  return {
+    next: kept.length !== entries.length ? Object.fromEntries(kept) : null,
+    eagerServerNames: kept.map(([key]) => key),
+    deferredIrrelevant: deferred,
+  };
+}
+
 function openCodeRuntimeDiagnosticsFromToolSurface(
   toolSurfaceResult: AppliedOpenCodeMcpToolSurfaceResult,
+  eagerResult: AppliedOpenCodeEagerMcpResult,
+  eagerActive: boolean,
 ): OpenCodeRuntimeDiagnostics {
-  if (toolSurfaceResult.beforeCount === 0) return {};
+  if (toolSurfaceResult.beforeCount === 0 && !eagerActive) return {};
   return {
     mcp: {
       serverNames: {
@@ -267,6 +364,8 @@ function openCodeRuntimeDiagnosticsFromToolSurface(
       removedByAllowlist: [...toolSurfaceResult.removedByAllowlist],
       removedByDenylist: [...toolSurfaceResult.removedByDenylist],
       removedAsAliases: [...toolSurfaceResult.removedAsAliases],
+      eagerServerNames: [...eagerResult.eagerServerNames],
+      deferredIrrelevant: [...eagerResult.deferredIrrelevant],
     },
   };
 }
@@ -274,6 +373,8 @@ function openCodeRuntimeDiagnosticsFromToolSurface(
 export async function prepareOpenCodeRuntimeConfig(input: {
   env: Record<string, string>;
   config: Record<string, unknown>;
+  /** Task wake payload; when it declares `mcpScope` the runtime loads only those servers before inference. */
+  wake?: unknown;
   targetIsRemote?: boolean;
 }): Promise<PreparedOpenCodeRuntimeConfig> {
   const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
@@ -387,20 +488,38 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     nextConfig.provider = nextProvider;
   }
 
+  // Eager-minimal task scope (KOMAA-126): a task-declared mcpScope defers every
+  // irrelevant server from BEFORE-inference load (progressive disclosure) so the
+  // bootstrap tool surface carries only what this task can use. The deferred set
+  // is recorded in diagnostics and never silently dropped.
+  const eagerScope = resolveOpenCodeEagerMcpScope({ config: input.config, env: input.env, wake: input.wake });
+  const eagerResult = applyOpenCodeEagerMinimalMcpSurface(existingConfig.mcp, eagerScope);
+  const mcpAfterEager = eagerResult.next ?? existingConfig.mcp;
+
   // Measure and optionally constrain the per-run MCP tool surface. Without an
   // explicit allow/deny configuration every configured server stays enabled
   // (unchanged behavior); the measurement note is always emitted so runs carry
   // BEFORE/AFTER tool-surface metrics for cost review.
   const toolSurfaceFilter = resolveOpenCodeMcpToolSurfaceFilter({ config: input.config, env: input.env });
-  const toolSurfaceResult = applyOpenCodeMcpToolSurface(existingConfig.mcp, toolSurfaceFilter);
-  if (toolSurfaceResult.beforeCount > 0 || toolSurfaceFilter.active) {
+  const toolSurfaceResult = applyOpenCodeMcpToolSurface(mcpAfterEager, toolSurfaceFilter);
+  if (eagerScope.active || toolSurfaceResult.beforeCount > 0 || toolSurfaceFilter.active) {
+    const beforeCount = toolSurfaceResult.beforeCount;
+    if (eagerScope.active) {
+      notes.push(
+        `Eager-minimal MCP scope: ${eagerResult.eagerServerNames.length} relevant server(s) load before inference` +
+          `${eagerResult.deferredIrrelevant.length ? `; deferred irrelevant: ${eagerResult.deferredIrrelevant.join(", ")}` : ""}.`,
+      );
+    }
     notes.push(
-      `MCP tool surface: ${toolSurfaceResult.beforeCount} server(s) configured -> ${toolSurfaceResult.afterCount} enabled` +
+      `MCP tool surface: ${beforeCount} server(s) configured -> ${toolSurfaceResult.afterCount} enabled` +
         `${toolSurfaceResult.removedByAllowlist.length ? `; allowlist removed: ${toolSurfaceResult.removedByAllowlist.join(", ")}` : ""}` +
         `${toolSurfaceResult.removedByDenylist.length ? `; denylist removed: ${toolSurfaceResult.removedByDenylist.join(", ")}` : ""}` +
         `${toolSurfaceResult.removedAsAliases.length ? `; duplicate aliases collapsed: ${toolSurfaceResult.removedAsAliases.join(", ")}` : ""}` +
         `.`,
     );
+    if (eagerResult.next !== null) {
+      nextConfig.mcp = eagerResult.next;
+    }
     if (toolSurfaceResult.next !== null) {
       nextConfig.mcp = toolSurfaceResult.next;
     }
@@ -419,13 +538,28 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   }
   await fs.writeFile(runtimeConfigPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
 
+  // Measure the host plugin surface inherited into this runtime snapshot.
+  // OpenCode loads plugins from <config>/plugin; the managed runtime copies the
+  // host config dir, so the count here is what the run can actually inherit
+  // (0 when OPENCODE_DISABLE_PROJECT_CONFIG keeps host config isolated).
+  const inheritedPluginCount = await fs
+    .readdir(path.join(runtimeConfigDir, "plugin"), { withFileTypes: true })
+    .then((entries) => entries.length)
+    .catch(() => 0);
+
   return {
     env: {
       ...input.env,
       XDG_CONFIG_HOME: runtimeConfigHome,
     },
     notes,
-    runtimeDiagnostics: openCodeRuntimeDiagnosticsFromToolSurface(toolSurfaceResult),
+    runtimeDiagnostics: {
+      ...openCodeRuntimeDiagnosticsFromToolSurface(toolSurfaceResult, eagerResult, eagerScope.active),
+      executionSurface: {
+        projectConfigDisabled: true,
+        inheritedPluginCount,
+      },
+    },
     cleanup: async () => {
       await fs.rm(runtimeConfigHome, { recursive: true, force: true });
     },

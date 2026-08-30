@@ -57,6 +57,10 @@ import {
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 import {
+  evaluateOpenCodeRunPreflight,
+  OpenCodeRunPreflightError,
+} from "./run-preflight.js";
+import {
   applyOpenCodeSessionRotation,
   resolveOpenCodeSessionRotation,
   savedResumeCount,
@@ -325,7 +329,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config, wake: context.paperclipWake });
+  // Deterministic run preflight BEFORE any model-backed inference (KOMAA-126):
+  // compare the task-declared execution contract against what this runtime
+  // actually resolved. A doomed run must die here, not after a full-price
+  // bootstrap (KOMAA-134: required host config vs isolated synthetic runtime;
+  // required model vs resolved provider/model).
+  const runPreflight = evaluateOpenCodeRunPreflight({
+    contract: context.paperclipRunContract,
+    resolvedModel: model,
+    projectConfigDisabled:
+      preparedRuntimeConfig.runtimeDiagnostics.executionSurface?.projectConfigDisabled ??
+      (env.OPENCODE_DISABLE_PROJECT_CONFIG === "true" ? true : null),
+    inheritedPluginCount:
+      preparedRuntimeConfig.runtimeDiagnostics.executionSurface?.inheritedPluginCount ?? null,
+  });
+  if (!runPreflight.ok) {
+    await onLog(
+      "stderr",
+      `[paperclip] ${new OpenCodeRunPreflightError(runPreflight.mismatches).message}\n`,
+    );
+    throw new OpenCodeRunPreflightError(runPreflight.mismatches);
+  }
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {

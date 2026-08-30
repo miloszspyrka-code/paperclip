@@ -2,7 +2,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
+import {
+  applyOpenCodeEagerMinimalMcpSurface,
+  prepareOpenCodeRuntimeConfig,
+  resolveOpenCodeEagerMcpScope,
+} from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
 
@@ -411,7 +415,10 @@ describe("prepareOpenCodeRuntimeConfig", () => {
           removedByAllowlist: [],
           removedByDenylist: [],
           removedAsAliases: [],
+          eagerServerNames: ["github", "github-alias", "filesystem", "slack"],
+          deferredIrrelevant: [],
         },
+        executionSurface: { projectConfigDisabled: true, inheritedPluginCount: 0 },
       });
       await prepared.cleanup();
     });
@@ -433,20 +440,115 @@ describe("prepareOpenCodeRuntimeConfig", () => {
           removedByAllowlist: ["slack"],
           removedByDenylist: [],
           removedAsAliases: ["github-alias (= github)"],
+          eagerServerNames: ["github", "github-alias", "filesystem", "slack"],
+          deferredIrrelevant: [],
         },
+        executionSurface: { projectConfigDisabled: true, inheritedPluginCount: 0 },
       });
       await prepared.cleanup();
     });
 
-    it("emits empty runtime diagnostics when no mcp block is configured", async () => {
+    it("defers irrelevant MCP servers from before-inference load when a task declares mcpScope (eager-minimal)", async () => {
+      const configHome = await makeConfigHome({ permission: {}, mcp: mcpFixture });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: {},
+        wake: { mcpScope: "github, filesystem" },
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+      const runtimeConfig = JSON.parse(
+        await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+      ) as { mcp?: Record<string, unknown> };
+      // Irrelevant servers must be absent from the enabled surface BEFORE inference.
+      expect(Object.keys(runtimeConfig.mcp ?? {}).sort()).toEqual(["filesystem", "github"]);
+      expect(prepared.runtimeDiagnostics.mcp?.eagerServerNames.sort()).toEqual(["filesystem", "github"]);
+      expect(prepared.runtimeDiagnostics.mcp?.deferredIrrelevant.sort()).toEqual(["github-alias", "slack"]);
+      await prepared.cleanup();
+    });
+
+    it("honours agent config toolSurface.mcpScope when the wake does not declare one", async () => {
+      const configHome = await makeConfigHome({ permission: {}, mcp: mcpFixture });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome },
+        config: { toolSurface: { mcpScope: ["github"] } },
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+      expect(prepared.runtimeDiagnostics.mcp?.eagerServerNames).toEqual(["github"]);
+      expect(prepared.runtimeDiagnostics.mcp?.deferredIrrelevant.sort()).toEqual(["filesystem", "github-alias", "slack"]);
+      await prepared.cleanup();
+    });
+
+    it("emits only execution-surface diagnostics when no mcp block is configured", async () => {
       const configHome = await makeConfigHome({ permission: {} });
       const prepared = await prepareOpenCodeRuntimeConfig({
         env: { XDG_CONFIG_HOME: configHome },
         config: {},
       });
       cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
-      expect(prepared.runtimeDiagnostics).toEqual({});
+      expect(prepared.runtimeDiagnostics).toEqual({
+        executionSurface: { projectConfigDisabled: true, inheritedPluginCount: 0 },
+      });
       await prepared.cleanup();
     });
+  });
+});
+
+describe("resolveOpenCodeEagerMcpScope", () => {
+  it("returns inactive with no relevant keys when nothing declares a scope", () => {
+    expect(resolveOpenCodeEagerMcpScope({ config: {}, env: {} })).toEqual({
+      relevantServerKeys: null,
+      active: false,
+    });
+  });
+
+  it("prefers the task wake mcpScope over agent config and env", () => {
+    const result = resolveOpenCodeEagerMcpScope({
+      config: { toolSurface: { mcpScope: ["github"] } },
+      env: { PAPERCLIP_OPENCODE_EAGER_MCP_SCOPE: "github, slack" },
+      wake: { mcpScope: "filesystem" },
+    });
+    expect(result.active).toBe(true);
+    expect([...result.relevantServerKeys!]).toEqual(["filesystem"]);
+  });
+
+  it("falls back to agent config scope then env scope", () => {
+    expect([...(resolveOpenCodeEagerMcpScope({ config: { toolSurface: { mcpScope: "github, slack" } }, env: {} }).relevantServerKeys!)]).toEqual([
+      "github",
+      "slack",
+    ]);
+    expect([...(resolveOpenCodeEagerMcpScope({ config: {}, env: { PAPERCLIP_OPENCODE_EAGER_MCP_SCOPE: "gitlab" } }).relevantServerKeys!)]).toEqual([
+      "gitlab",
+    ]);
+  });
+});
+
+describe("applyOpenCodeEagerMinimalMcpSurface", () => {
+  const mcp = { github: { url: "a" }, slack: { url: "b" }, gitlab: { url: "c" } };
+
+  it("keeps the full surface when inactive (unchanged behavior)", () => {
+    const result = applyOpenCodeEagerMinimalMcpSurface(mcp, { relevantServerKeys: null, active: false });
+    expect(result.next).toBeNull();
+    expect(result.eagerServerNames.sort()).toEqual(["github", "gitlab", "slack"]);
+    expect(result.deferredIrrelevant).toEqual([]);
+  });
+
+  it("defers every server outside the relevant set", () => {
+    const result = applyOpenCodeEagerMinimalMcpSurface(mcp, {
+      relevantServerKeys: new Set(["github"]),
+      active: true,
+    });
+    expect(Object.keys(result.next ?? {})).toEqual(["github"]);
+    expect(result.eagerServerNames).toEqual(["github"]);
+    expect(result.deferredIrrelevant.sort()).toEqual(["gitlab", "slack"]);
+  });
+
+  it("returns no change when every configured server is relevant", () => {
+    const result = applyOpenCodeEagerMinimalMcpSurface(mcp, {
+      relevantServerKeys: new Set(["github", "slack", "gitlab"]),
+      active: true,
+    });
+    expect(result.next).toBeNull();
+    expect(result.deferredIrrelevant).toEqual([]);
   });
 });
