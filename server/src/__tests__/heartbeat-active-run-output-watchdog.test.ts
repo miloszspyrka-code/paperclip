@@ -1011,4 +1011,25 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     });
     expect(decision.createdByRunId).toBe(managerRunId);
   });
+
+  it("projects captured stdout/stderr into the public run list (observability regression: cancelled run exposed no output)", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const seededExcerpt = "OPENAI_API_KEY=sk-test-secret-value should not leak";
+    const { companyId, coderId, runId } = await seedRunningRun({
+      now,
+      ageMs: 1000,
+      withOutput: true,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ stderrExcerpt: "warn: deprecation" })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const heartbeat = heartbeatService(db);
+    const listed = await heartbeat.list(companyId, coderId);
+    const run = listed.find((r) => r.id === runId);
+    expect(run).toBeTruthy();
+    expect(run?.stdoutExcerpt).toBe(seededExcerpt);
+    expect(run?.stderrExcerpt).toBe("warn: deprecation");
+  });
 });

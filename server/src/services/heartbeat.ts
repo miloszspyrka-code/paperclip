@@ -2358,8 +2358,8 @@ const heartbeatRunListColumns = {
   logBytes: heartbeatRuns.logBytes,
   logSha256: heartbeatRuns.logSha256,
   logCompressed: heartbeatRuns.logCompressed,
-  stdoutExcerpt: sql<string | null>`NULL`.as("stdoutExcerpt"),
-  stderrExcerpt: sql<string | null>`NULL`.as("stderrExcerpt"),
+  stdoutExcerpt: heartbeatRuns.stdoutExcerpt,
+  stderrExcerpt: heartbeatRuns.stderrExcerpt,
   errorCode: heartbeatRuns.errorCode,
   externalRunId: heartbeatRuns.externalRunId,
   processPid: heartbeatRuns.processPid,
@@ -19538,11 +19538,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ...heartbeatRunListContextColumns,
               }
             : safeForLegacyEncoding
-            ? {
-                ...heartbeatRunListColumns,
-                error: sql<string | null>`NULL`.as("error"),
-                ...heartbeatRunListContextColumns,
-              }
+              ? {
+                  ...heartbeatRunListColumns,
+                  error: sql<string | null>`NULL`.as("error"),
+                  stdoutExcerpt: sql<string | null>`NULL`.as("stdoutExcerpt"),
+                  stderrExcerpt: sql<string | null>`NULL`.as("stderrExcerpt"),
+                  ...heartbeatRunListContextColumns,
+                }
             : {
                 ...heartbeatRunListColumns,
                 ...heartbeatRunListContextColumns,
