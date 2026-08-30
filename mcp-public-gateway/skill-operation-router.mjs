@@ -116,7 +116,7 @@ export function createSkillOperationRouter({ defaultApp, operatorSkills, readSki
     try {
       const rec = await ensureUpSession(session, app);
       if (!rec.tools) {
-        const listed = await upstreamCall(app, rec.upId, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+        const listed = await upstreamCall(app, rec.upId, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, session.oauthPayload);
         rec.tools = listed.json.result?.tools || [];
       }
       upstreamToolCount = rec.tools.length;

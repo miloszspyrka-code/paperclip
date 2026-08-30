@@ -65,6 +65,9 @@ pnpm dev
 
 ## 5. Core Engineering Rules
 
+0. Persist end-to-end within one run.
+Use all available repository state, runtime evidence, credentials already present in the environment, and permitted tools to carry the task through implementation, verification, and hand-off. Do not stop at the first recoverable blocker or defer an actionable step back to the user. If an external or safety boundary is genuinely blocking, exhaust local diagnostics and safe fixes first, then report the exact blocker and the smallest required user action.
+
 1. Keep changes company-scoped.
 Every domain entity should be scoped to a company and company boundaries must be enforced in routes/services.
 

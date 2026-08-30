@@ -73,14 +73,34 @@ const PRINCIPALS = configuredPrincipals();
 function principalForLogin(login) {
   const configured = PRINCIPALS[login];
   if (!configured || typeof configured !== "object") {
-    // Existing installations keep their legacy operator tools, but no document
-    // or Wiki company scope is granted until an explicit identity mapping exists.
+    // An unconfigured login receives no company scope and cannot reach an
+    // upstream service because no Board credential can be resolved for it.
     return { sub: `external:${login}`, companyIds: [] };
   }
   return {
     sub: typeof configured.sub === "string" && configured.sub.trim() ? configured.sub.trim() : `external:${login}`,
     companyIds: Array.isArray(configured.companyIds) ? configured.companyIds.filter((id) => typeof id === "string") : [],
   };
+}
+
+function configuredPrincipalForSubject(subject) {
+  const matches = Object.values(PRINCIPALS).filter((configured) =>
+    configured
+    && typeof configured === "object"
+    && typeof configured.sub === "string"
+    && configured.sub.trim() === subject,
+  );
+  return matches.length === 1 ? matches[0] : null;
+}
+
+// OAuth tokens contain only the subject and its company scope. The matching
+// Board credential remains in gateway configuration and is never signed into,
+// logged from, or returned through the OAuth token.
+function upstreamTokenForPrincipal(payload, app) {
+  const configured = configuredPrincipalForSubject(payload?.sub);
+  const tokens = configured?.upstreamTokens;
+  const token = tokens && typeof tokens === "object" ? tokens[app] : null;
+  return typeof token === "string" && token.trim() ? token.trim() : null;
 }
 
 function scopes(payload) {
@@ -94,8 +114,8 @@ function hasScope(payload, scope) {
 function requiredScopeForTool(name) {
   if (["paperclipListDocuments", "paperclipGetDocument", "paperclipGetDocumentHistory", "paperclipGetDocumentRevision"].includes(name)) return "paperclip:documents:read";
   if (name === "paperclipUpdateDocument") return "paperclip:documents:write";
-  if (["paperclipWikiList", "paperclipWikiSearch", "paperclipWikiGetPage", "paperclipWikiGetMetadata"].includes(name)) return "paperclip:wiki:read";
-  if (["paperclipWikiProposeChange", "paperclipWikiApplyChange"].includes(name)) return "paperclip:wiki:write";
+  if (["paperclipWikiList", "paperclipWikiSearch", "paperclipWikiGetPage", "paperclipWikiGetMetadata"].includes(name)) return "mcp:read";
+  if (["paperclipWikiProposeChange", "paperclipWikiApplyChange"].includes(name)) return "mcp:write";
   if (PUBLIC_WRITE_TOOL_NAMES.has(name)) return "mcp:write";
   return "mcp:read";
 }
@@ -581,10 +601,34 @@ function publicSkillMetadata(skill) {
 const PUBLIC_WRITE_TOOL_NAMES = new Set([
   "paperclipCreateIssue",
   "paperclipUpdateIssue",
+  "paperclipUpdateAgent",
   "paperclipAddComment",
+  "paperclipResolveIssueInteraction",
+  "paperclipApprovalDecision",
+  "paperclipCancelHeartbeatRun",
   "paperclipControlIssueWorkspaceServices",
   "paperclipUpdateDocument",
   "paperclipWikiApplyChange",
+  "paperclipCreateSecret",
+  "paperclipUpdateSecret",
+  "paperclipRotateSecret",
+  "paperclipDeleteSecret",
+  "paperclipCreateToolApplication",
+  "paperclipUpdateToolApplication",
+  "paperclipCreateToolConnection",
+  "paperclipUpdateToolConnection",
+  "paperclipTestToolConnection",
+  "paperclipRefreshToolConnectionCatalog",
+  "paperclipCreateToolProfile",
+  "paperclipUpdateToolProfile",
+  "paperclipBindToolProfile",
+  "paperclipSetAgentAppPermission",
+  "paperclipSetAgentAppInstallPolicy",
+  "paperclipCreateToolGateway",
+  "paperclipUpdateToolGateway",
+  "paperclipPrepareIssueDelivery",
+  "paperclipCreateIssuePullRequest",
+  "paperclipMergeIssuePullRequest",
 ]);
 
 // ---------- OAuth model ----------
@@ -862,7 +906,10 @@ const fail = (error, description) => {
         try { method = JSON.parse(raw || "{}").method || ""; } catch {}
         return sendMcp401(res, app, method, headerAuth);
       }
-      return proxyToApp(req, res, app);
+      if (!upstreamTokenForPrincipal(payload, app)) {
+        return sendJson(res, 403, { jsonrpc: "2.0", error: { code: -32003, message: "UPSTREAM_PRINCIPAL_UNCONFIGURED" }, id: null });
+      }
+      return proxyToApp(req, res, app, payload);
     }
 
     sendJson(res, 404, { error: "Not found" });
@@ -899,15 +946,19 @@ ${errBlock}
 </body></html>`;
 }
 
-function proxyToApp(req, res, app) {
+function proxyToApp(req, res, app, payload) {
   const target = TARGETS[app];
+  const upstreamToken = upstreamTokenForPrincipal(payload, app);
+  if (!upstreamToken) {
+    return sendJson(res, 403, { jsonrpc: "2.0", error: { code: -32003, message: "UPSTREAM_PRINCIPAL_UNCONFIGURED" }, id: null });
+  }
   const upstream = new URL(target.url);
   const httpMod = upstream.protocol === "https:" ? https : http;
   const headers = {
     "content-type": req.headers["content-type"] || "application/json",
     accept: req.headers["accept"] || "application/json, text/event-stream",
     ...(req.headers["mcp-session-id"] ? { "mcp-session-id": req.headers["mcp-session-id"] } : {}),
-    ...(target.token ? { authorization: `Bearer ${target.token}` } : {}),
+    authorization: `Bearer ${upstreamToken}`,
   };
   const upstreamReq = httpMod.request({
     hostname: upstream.hostname,
@@ -933,8 +984,14 @@ function proxyToApp(req, res, app) {
 const portalSessions = new Map();
 const PREFIXED = Object.keys(TARGETS).filter((a) => a !== DEFAULT_APP);
 
-function upstreamCall(app, upSessionId, payload) {
+function upstreamCall(app, upSessionId, payload, oauthPayload) {
   const target = TARGETS[app];
+  const upstreamToken = upstreamTokenForPrincipal(oauthPayload, app);
+  if (!upstreamToken) {
+    const error = new Error("UPSTREAM_PRINCIPAL_UNCONFIGURED");
+    error.code = "UPSTREAM_PRINCIPAL_UNCONFIGURED";
+    throw error;
+  }
   const url = new URL(target.path || "/mcp", target.url).toString();
   return fetch(url, {
     method: "POST",
@@ -942,7 +999,7 @@ function upstreamCall(app, upSessionId, payload) {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
       ...(upSessionId ? { "mcp-session-id": upSessionId } : {}),
-      ...(target.token ? { authorization: `Bearer ${target.token}` } : {}),
+      authorization: `Bearer ${upstreamToken}`,
     },
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(30000),
@@ -979,10 +1036,10 @@ async function ensureUpSession(ps, app) {
   const init = await upstreamCall(app, null, {
     jsonrpc: "2.0", id: 1, method: "initialize",
     params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "kompas-mcp", version: "1.0.0" } },
-  });
+  }, ps.oauthPayload);
   const rec = { upId: init.upSessionId || null, inited: true, tools: null };
   ps.apps[app] = rec;
-  if (rec.upId) await upstreamCall(app, rec.upId, { jsonrpc: "2.0", method: "notifications/initialized" }).catch(() => {});
+  if (rec.upId) await upstreamCall(app, rec.upId, { jsonrpc: "2.0", method: "notifications/initialized" }, ps.oauthPayload).catch(() => {});
   return rec;
 }
 
@@ -996,7 +1053,7 @@ async function aggregatedTools(ps) {
     const rec = await ensureUpSession(ps, app);
     try {
       if (!rec.tools) {
-        const r = await upstreamCall(app, rec.upId, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+        const r = await upstreamCall(app, rec.upId, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, ps.oauthPayload);
         rec.tools = r.json.result?.tools || [];
       }
       for (const t of rec.tools) out.push({ ...t, name: toolNameFor(app, t.name) });
@@ -1018,7 +1075,7 @@ async function callUpstreamTool(ps, name, args) {
     id: randToken(8),
     method: "tools/call",
     params: { name, arguments: args },
-  });
+  }, ps.oauthPayload);
   if (response.json.error) {
     const error = new Error(response.json.error.message || "Upstream tool failed");
     error.upstream = response.json.error;
@@ -1273,7 +1330,7 @@ async function handlePublicGatewayTool({ ps, payload, name, args }) {
 async function listPublicResources(ps, payload) {
   const resources = [];
   const companyIds = Array.isArray(payload.company_ids) ? payload.company_ids : [];
-  if (hasScope(payload, "paperclip:wiki:read")) {
+  if (hasScope(payload, "mcp:read")) {
     for (const companyId of companyIds) {
       try {
         const result = (await publicWikiCall(ps, payload, "wiki_list_pages", { companyId })).data;
@@ -1337,7 +1394,7 @@ async function readPublicResource(ps, payload, uri) {
   }
   const wikiMatch = /^paperclip:\/\/companies\/([^/]+)\/wiki\/pages\/([^/]+)$/.exec(uri);
   if (wikiMatch) {
-    if (!hasScope(payload, "paperclip:wiki:read")) return rpcError(-32003, "INSUFFICIENT_SCOPE", { code: "INSUFFICIENT_SCOPE", requiredScope: "paperclip:wiki:read" });
+    if (!hasScope(payload, "mcp:read")) return rpcError(-32003, "INSUFFICIENT_SCOPE", { code: "INSUFFICIENT_SCOPE", requiredScope: "mcp:read" });
     const companyId = selectCompany(payload, decodeURIComponent(wikiMatch[1]));
     const page = assertPublicWikiPage(decodeURIComponent(wikiMatch[2]));
     const data = (await publicWikiCall(ps, payload, "wiki_read_page", { companyId, page })).data;
@@ -1366,12 +1423,18 @@ async function handleAggregate(req, res) {
   let ps = portalSessions.get(clientSid);
   const isNew = !ps;
   if (!ps) {
-    ps = { apps: {}, lastUsed: nowMs() };
+    ps = { apps: {}, lastUsed: nowMs(), oauthPayload: payload, principalSubject: payload.sub };
     const newSid = randToken(16);
     portalSessions.set(newSid, ps);
     ps.sid = newSid;
+  } else if (ps.principalSubject !== payload.sub) {
+    return sendJson(res, 401, { jsonrpc: "2.0", id: null, error: { code: -32001, message: "MCP_SESSION_PRINCIPAL_MISMATCH" } });
   }
   ps.lastUsed = nowMs();
+
+  if (!upstreamTokenForPrincipal(payload, DEFAULT_APP)) {
+    return sendJson(res, 403, { jsonrpc: "2.0", id: null, error: { code: -32003, message: "UPSTREAM_PRINCIPAL_UNCONFIGURED" } });
+  }
 
   const method = msg.method || "";
   const id = msg.id;
@@ -1473,7 +1536,7 @@ async function handleAggregate(req, res) {
       const sessionHeaders = isNew ? { "mcp-session-id": ps.sid } : {};
       await sendToolResponse(req, res, sessionHeaders, async () => {
         const rec = await ensureUpSession(ps, app);
-        const r = await upstreamCall(app, rec.upId, { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: msg.params?.arguments || {} } });
+        const r = await upstreamCall(app, rec.upId, { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: msg.params?.arguments || {} } }, ps.oauthPayload);
         return { status: r.status || 200, body: r.json };
       });
     } catch (e) {

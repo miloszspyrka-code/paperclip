@@ -238,7 +238,9 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     return Boolean(agent && !["paused", "terminated", "pending_approval"].includes(agent.status));
   }
 
-  async function isProductivityReviewDescendant(issue: Pick<IssueRow, "companyId" | "parentId">) {
+  const RECOVERY_ORIGIN_KIND_SET = new Set(Object.values(RECOVERY_ORIGIN_KINDS));
+
+  async function isRecoveryDescendant(issue: Pick<IssueRow, "companyId" | "parentId">) {
     let parentId = issue.parentId;
     let depth = 0;
     while (parentId && depth < MAX_PARENT_WALK_DEPTH) {
@@ -248,11 +250,15 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         .where(and(eq(issues.companyId, issue.companyId), eq(issues.id, parentId)))
         .then((rows) => rows[0] ?? null);
       if (!parent) return false;
-      if (parent.originKind === PRODUCTIVITY_REVIEW_ORIGIN_KIND) return true;
+      if (parent.originKind && RECOVERY_ORIGIN_KIND_SET.has(parent.originKind as never)) return true;
       parentId = parent.parentId;
       depth += 1;
     }
     return false;
+  }
+
+  async function isProductivityReviewDescendant(issue: Pick<IssueRow, "companyId" | "parentId">) {
+    return isRecoveryDescendant(issue);
   }
 
   async function findOpenProductivityReview(companyId: string, sourceIssueId: string) {
@@ -856,7 +862,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           isNull(issues.assigneeUserId),
           inArray(issues.status, ["todo", "in_progress"]),
           sql`${issues.assigneeAgentId} is not null`,
-          sql`${issues.originKind} <> ${PRODUCTIVITY_REVIEW_ORIGIN_KIND}`,
+          sql`(${issues.originKind} is null or ${issues.originKind} not in (${sql.join(Object.values(RECOVERY_ORIGIN_KINDS).map((kind) => sql`${kind}`), sql`, `)}))`,
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
       )

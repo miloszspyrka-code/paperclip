@@ -6178,6 +6178,15 @@ describeEmbeddedPostgres("tool access service", () => {
     );
   });
 
+  it("treats deleting an already absent connection as idempotent", async () => {
+    const app = createRouteApp(db);
+
+    const res = await request(app).delete(`/api/tool-connections/${randomUUID()}`);
+
+    expect(res.status).toBe(204);
+    expect(res.text).toBe("");
+  });
+
   it("keeps the application active when another connection remains", async () => {
     const company = await createCompany(db);
     const service = toolAccessService(db);
@@ -7184,7 +7193,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(unusedRow!.lastUsedAt).toBeNull();
   });
 
-  it("syncs installs, auto-extends agent access, and exposes install state", async () => {
+  it("syncs installs without extending agent access and exposes install state", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { connection } = await createRemoteToolFixture(db, company.id);
@@ -7202,26 +7211,136 @@ describeEmbeddedPostgres("tool access service", () => {
 
     const [install] = await db.select().from(toolConnectionInstalls);
     expect(install).toMatchObject({ companyId: company.id, connectionId: connection.id, targetId: agent.id });
-    const profile = await db.select().from(toolProfiles).where(eq(toolProfiles.profileKey, `app:${connection.id}`));
-    expect(profile).toHaveLength(1);
-    const binding = await db.select().from(toolProfileBindings).where(and(
-      eq(toolProfileBindings.profileId, profile[0]!.id),
-      eq(toolProfileBindings.targetType, "agent"),
-      eq(toolProfileBindings.targetId, agent.id),
-    ));
-    expect(binding).toHaveLength(1);
-    const events = await db.select().from(activityLog).where(eq(activityLog.action, "tool_connection.install_access_extended"));
-    expect(events).toHaveLength(1);
-
     const effective = await toolAccessService(db).getEffectiveProfilesForAgent(company.id, agent.id);
     expect(effective.installedConnections.map((item) => item.id)).toEqual([connection.id]);
-    expect(effective.allowedTools.some((tool) => tool.connectionId === connection.id)).toBe(true);
+    expect(effective.allowedTools.some((tool) => tool.connectionId === connection.id)).toBe(false);
 
     const get = await request(app).get(`/api/tool-connections/${connection.id}`);
     expect(get.status).toBe(200);
     expect(get.body.installs).toEqual(expect.arrayContaining([
       expect.objectContaining({ targetType: "agent", targetId: agent.id }),
     ]));
+  });
+
+  it("sets connection permission independently from every-run installation", async () => {
+    const company = await createCompany(db);
+    const permittedAgent = await createAgent(db, company.id);
+    const installedAgent = await createAgent(db, company.id);
+    const { connection } = await createRemoteToolFixture(db, company.id);
+    const app = createRouteApp(db);
+
+    const permission = await request(app)
+      .put(`/api/tool-connections/${connection.id}/agent-permission`)
+      .send({ mode: "specific_agents", agentIds: [permittedAgent.id] });
+    expect(permission.status).toBe(200);
+    expect(permission.body).toMatchObject({
+      profileId: expect.any(String),
+      before: { mode: "none", agentIds: [] },
+      after: { mode: "specific_agents", agentIds: [permittedAgent.id] },
+    });
+
+    const install = await request(app)
+      .put(`/api/tool-connections/${connection.id}/installs`)
+      .send({ installs: [{ targetType: "agent", targetId: installedAgent.id }] });
+    expect(install.status).toBe(200);
+
+    const service = toolAccessService(db);
+    const permitted = await service.listAgentAppBindings(company.id, permittedAgent.id);
+    const installed = await service.listAgentAppBindings(company.id, installedAgent.id);
+    expect(permitted.find((row) => row.connection.id === connection.id)).toMatchObject({
+      permitted: { forAgent: true, mode: "specific_agents", agentIds: [permittedAgent.id] },
+      installedEveryRun: { forAgent: false, mode: "specific_agents", agentIds: [installedAgent.id] },
+    });
+    expect(installed.find((row) => row.connection.id === connection.id)).toMatchObject({
+      permitted: { forAgent: false, mode: "specific_agents", agentIds: [permittedAgent.id] },
+      installedEveryRun: { forAgent: true, mode: "specific_agents", agentIds: [installedAgent.id] },
+    });
+
+    const events = await db.select().from(activityLog).where(eq(activityLog.action, "tool_connection.agent_permission_set"));
+    expect(events).toHaveLength(1);
+  });
+
+  it("projects permission and every-run install scopes independently without secrets", async () => {
+    const company = await createCompany(db);
+    const selectedAgent = await createAgent(db, company.id);
+    const permittedOnlyForOtherAgent = await createAgent(db, company.id);
+    const specific = await createRemoteToolFixture(db, company.id);
+    const companyWide = await createRemoteToolFixture(db, company.id);
+    const service = toolAccessService(db);
+
+    const [specificProfile] = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: `app:${specific.connection.id}`,
+      name: `Specific app profile ${randomUUID()}`,
+      defaultAction: "deny",
+      metadata: { source: "tool_connection_install" },
+    }).returning();
+    await db.insert(toolProfileBindings).values({
+      companyId: company.id,
+      profileId: specificProfile!.id,
+      targetType: "agent",
+      targetId: permittedOnlyForOtherAgent.id,
+    });
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company.id,
+      connectionId: specific.connection.id,
+      targetType: "agent",
+      targetId: selectedAgent.id,
+    });
+
+    const [companyWideProfile] = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: `app:${companyWide.connection.id}`,
+      name: `Company app profile ${randomUUID()}`,
+      defaultAction: "deny",
+      metadata: { source: "tool_connection_install" },
+    }).returning();
+    await db.insert(toolProfileBindings).values({
+      companyId: company.id,
+      profileId: companyWideProfile!.id,
+      targetType: "company",
+      targetId: company.id,
+    });
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company.id,
+      connectionId: companyWide.connection.id,
+      targetType: "company",
+      targetId: company.id,
+    });
+
+    const rows = await service.listAgentAppBindings(company.id, selectedAgent.id);
+    const specificRow = rows.find((row) => row.connection.id === specific.connection.id)!;
+    const companyWideRow = rows.find((row) => row.connection.id === companyWide.connection.id)!;
+
+    expect(specificRow).toMatchObject({
+      app: { id: specific.application.id, name: specific.application.name, type: "mcp_http", status: "active" },
+      connection: { id: specific.connection.id, name: specific.connection.name, transport: "mcp_remote", status: "active", enabled: true },
+      permitted: { forAgent: false, mode: "specific_agents", agentIds: [permittedOnlyForOtherAgent.id] },
+      installedEveryRun: { forAgent: true, mode: "specific_agents", agentIds: [selectedAgent.id], futureAgentAutoInstall: false },
+    });
+    expect(companyWideRow).toMatchObject({
+      permitted: { forAgent: true, mode: "all_agents", agentIds: [] },
+      installedEveryRun: { forAgent: true, mode: "all_agents", agentIds: [], futureAgentAutoInstall: true },
+    });
+    expect(JSON.stringify(rows)).not.toMatch(/credential|secret|transportConfig|config|metadata|url/i);
+  });
+
+  it("protects app-assignment visibility at the company boundary", async () => {
+    const company = await createCompany(db);
+    const otherCompany = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const app = createRouteApp(db);
+
+    const sameCompany = await request(app)
+      .get(`/api/tool-app-bindings?companyId=${company.id}&agentId=${agent.id}`);
+    expect(sameCompany.status).toBe(200);
+    expect(sameCompany.body).toMatchObject({ companyId: company.id, agentId: agent.id, bindings: [] });
+
+    const foreignAgent = await createAgent(db, otherCompany.id);
+    const foreign = await request(app)
+      .get(`/api/agents/${foreignAgent.id}/tool-apps?companyId=${company.id}`);
+    expect(foreign.status).toBe(404);
+    expect(foreign.body).toEqual({ error: "Agent not found" });
   });
 });
 

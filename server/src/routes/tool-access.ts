@@ -1,7 +1,7 @@
-import { Router, type Request } from "express";
+import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import { agents, companies } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   CONNECTABLE_APP_DEFINITIONS,
   DEFAULT_OWNERSHIP_AVAILABILITY,
@@ -23,6 +23,7 @@ import {
   duplicateToolProfileSchema,
   finishToolAppSchema,
   reconnectToolAppSchema,
+  setToolConnectionAgentPermissionSchema,
   reviewToolProfileNewToolsSchema,
   createToolTrustRuleFromActionRequestSchema,
   importMcpJsonSchema,
@@ -41,7 +42,7 @@ import {
   updateToolProfileWithEntriesSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { getActorInfo, assertBoard, assertCompanyAccess, getAccessibleResource, hasCompanyAccess } from "./authz.js";
+import { getActorInfo, assertBoard, assertBoardOrAgent, assertCompanyAccess, getAccessibleResource, hasCompanyAccess } from "./authz.js";
 import { badRequest, forbidden, unprocessable } from "../errors.js";
 import { accessService, googleSheetsRobotEmailFromEnv, logActivity, toolAccessPolicyService, toolAccessService } from "../services/index.js";
 import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-gateway.js";
@@ -114,6 +115,34 @@ export function toolAccessRoutes(
     return new URL("/api/tools/oauth/callback", configured).toString();
   }
   const access = accessService(db);
+
+  async function getReadableAgent(
+    req: Request,
+    res: Response,
+    agentId: string,
+    companyId?: string,
+  ) {
+    const [agent] = await db.select({ id: agents.id, companyId: agents.companyId })
+      .from(agents)
+      .where(companyId
+        ? and(eq(agents.id, agentId), eq(agents.companyId, companyId))
+        : eq(agents.id, agentId));
+    if (!agent || !hasCompanyAccess(req, agent.companyId)) {
+      res.status(404).json({ error: "Agent not found" });
+      return null;
+    }
+    assertCompanyAccess(req, agent.companyId);
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "agent:read",
+      resource: { type: "agent", companyId: agent.companyId, agentId: agent.id },
+    });
+    if (!decision.allowed) {
+      res.status(403).json({ error: "Agent is outside this actor's authorization boundary" });
+      return null;
+    }
+    return agent;
+  }
 
   async function assertBoardToolPermission(req: Request, companyId: string, permissionKey: PermissionKey) {
     assertBoard(req);
@@ -634,6 +663,41 @@ export function toolAccessRoutes(
     res.json({ connectionId: connection.id, installs: connection.installs ?? [] });
   });
 
+  router.get("/agents/:agentId/tool-apps", async (req, res) => {
+    assertBoardOrAgent(req);
+    const requestedCompanyId = typeof req.query.companyId === "string" ? req.query.companyId : undefined;
+    const agent = await getReadableAgent(req, res, req.params.agentId as string, requestedCompanyId);
+    if (!agent) return;
+    res.json({
+      agentId: agent.id,
+      companyId: agent.companyId,
+      apps: await svc.listAgentAppBindings(agent.companyId, agent.id),
+    });
+  });
+
+  router.get("/tool-app-bindings", async (req, res) => {
+    assertBoardOrAgent(req);
+    const queryCompanyId = typeof req.query.companyId === "string" ? req.query.companyId : undefined;
+    const queryAgentId = typeof req.query.agentId === "string" ? req.query.agentId : undefined;
+    const appId = typeof req.query.appId === "string" ? req.query.appId : undefined;
+    const companyId = req.actor.type === "agent" ? req.actor.companyId : queryCompanyId;
+    if (!companyId) {
+      throw badRequest("companyId is required for board app-assignment visibility");
+    }
+    assertCompanyAccess(req, companyId);
+    const agentId = queryAgentId ?? (req.actor.type === "agent" ? req.actor.agentId : undefined);
+    if (agentId) {
+      const agent = await getReadableAgent(req, res, agentId, companyId);
+      if (!agent) return;
+    }
+    res.json({
+      companyId,
+      agentId: agentId ?? null,
+      appId: appId ?? null,
+      bindings: await svc.listAgentAppBindings(companyId, agentId, appId),
+    });
+  });
+
   router.put(
     "/tool-connections/:connectionId/installs",
     validate(putToolConnectionInstallsSchema),
@@ -655,6 +719,31 @@ export function toolAccessRoutes(
         },
       });
       res.json(snapshot);
+    },
+  );
+
+  router.put(
+    "/tool-connections/:connectionId/agent-permission",
+    validate(setToolConnectionAgentPermissionSchema),
+    async (req, res) => {
+      const connection = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
+      if (!connection) return;
+      assertToolAppMutationAccess(req, connection.companyId);
+      const result = await svc.setConnectionAgentPermission(connection.id, req.body, getActorInfo(req));
+      await logActivity(db, {
+        companyId: connection.companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        action: "tool_connection.agent_permission_set",
+        entityType: "tool_connection",
+        entityId: connection.id,
+        details: {
+          mode: result.after.mode,
+          agentIds: result.after.agentIds,
+          profileId: result.profileId,
+        },
+      });
+      res.json(result);
     },
   );
 
@@ -787,12 +876,23 @@ export function toolAccessRoutes(
   });
 
   router.delete("/tool-connections/:connectionId", async (req, res) => {
-    const existing = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
-    if (!existing) return;
-    assertToolAppMutationAccess(req, existing.companyId);
-    const applicationBefore = await svc.getApplication(existing.applicationId);
-    const connection = await svc.archiveConnection(existing.id);
-    const applicationAfter = await svc.getApplication(existing.applicationId);
+    const existing = await svc.findConnection(req.params.connectionId as string);
+    if (!existing) {
+      // DELETE is idempotent: app connections can disappear between the list
+      // response and the user's confirmation (for example after a reconnect).
+      res.status(204).end();
+      return;
+    }
+    const accessible = await getAccessibleResource(req, res, existing, "Tool connection not found");
+    if (!accessible) return;
+    assertToolAppMutationAccess(req, accessible.companyId);
+    const applicationBefore = await svc.getApplication(accessible.applicationId);
+    const connection = await svc.archiveConnection(accessible.id);
+    if (!connection) {
+      res.status(204).end();
+      return;
+    }
+    const applicationAfter = await svc.getApplication(accessible.applicationId);
     await logActivity(db, {
       companyId: connection.companyId,
       actorType: "user",
@@ -820,7 +920,17 @@ export function toolAccessRoutes(
     const existing = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
     if (!existing) return;
     assertToolAppMutationAccess(req, existing.companyId);
-    res.json(await svc.checkHealth(existing.id, getActorInfo(req)));
+    const result = await svc.checkHealth(existing.id, getActorInfo(req));
+    await logActivity(db, {
+      companyId: existing.companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "tool_connection.health_checked",
+      entityType: "tool_connection",
+      entityId: existing.id,
+      details: { healthStatus: result.connection.healthStatus },
+    });
+    res.json(result);
   });
 
   router.post(
@@ -853,7 +963,17 @@ export function toolAccessRoutes(
     const existing = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
     if (!existing) return;
     assertToolAppMutationAccess(req, existing.companyId);
-    res.json(await svc.refreshCatalog(existing.id, getActorInfo(req)));
+    const result = await svc.refreshCatalog(existing.id, getActorInfo(req));
+    await logActivity(db, {
+      companyId: existing.companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "tool_connection.catalog_refreshed",
+      entityType: "tool_connection",
+      entityId: existing.id,
+      details: { catalogEntryCount: result.catalog.length },
+    });
+    res.json(result);
   });
 
   router.get("/tool-connections/:connectionId/catalog", async (req, res) => {
@@ -877,6 +997,13 @@ export function toolAccessRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     res.json({ profiles: await svc.listProfiles(companyId) });
+  });
+
+  router.get("/tool-profiles/:profileId", async (req, res) => {
+    assertBoard(req);
+    const existing = await getAccessibleResource(req, res, svc.getProfile(req.params.profileId as string), "Tool profile not found");
+    if (!existing) return;
+    res.json(existing);
   });
 
   router.get("/tool-profiles/:profileId/new-tools", async (req, res) => {

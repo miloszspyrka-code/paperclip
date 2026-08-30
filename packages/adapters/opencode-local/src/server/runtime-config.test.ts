@@ -132,6 +132,44 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     expect(config.mcp.Sender.headers.Authorization).toBe("Bearer FAKE_SENDER_TOKEN");
     expect(config.mcp.HOST_PRIVATE_SENDER).toBeUndefined();
     expect(prepared.diagnostics.mcp.inheritedUserMcpCount).toBe(0);
+    // Context-cost telemetry: exact server names/count and serialized managed
+    // config size; no secrets in the diagnostics payload.
+    expect(prepared.diagnostics.mcp.managedConnectionCount).toBe(2);
+    expect(prepared.diagnostics.mcp.serverNames.map((s) => s.name)).toEqual(["Sender", "Cloudflare"]);
+    expect(prepared.diagnostics.mcp.managedConnectionConfigChars).toBe(JSON.stringify(config.mcp).length);
+    expect(JSON.stringify(prepared.diagnostics)).not.toContain("FAKE_SENDER_TOKEN");
+    // OpenCode does not expose the registered tool inventory pre-run.
+    expect(prepared.diagnostics.tools.measurement).toBe("not_exposed");
+    expect(prepared.diagnostics.tools.registeredToolCount).toBe("NOT_EXPOSED");
+    await prepared.cleanup();
+  });
+
+  it("injects only ctb-* agents from the explicit deployment source", async () => {
+    const fixture = await makeFixture();
+    const nativeAgentsSource = path.join(fixture.root, "native-agents.json");
+    await fs.writeFile(nativeAgentsSource, JSON.stringify({
+      agent: {
+        "ctb-plan": { mode: "all", permission: { bash: "deny" } },
+        "ctb-engineer": { mode: "all", permission: { "git_*": "allow" } },
+        "not-ctb": { mode: "all", permission: { bash: "allow" } },
+        "ctb-invalid": ["not-an-agent-definition"],
+      },
+    }), "utf8");
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: {
+        PAPERCLIP_OPENCODE_RUNTIME_ROOT: fixture.runtime,
+        PAPERCLIP_AGENT_ID: "agent-a",
+        PAPERCLIP_RUN_ID: "run-a",
+        PAPERCLIP_OPENCODE_NATIVE_AGENTS_CONFIG: nativeAgentsSource,
+      },
+      config: {},
+      hostAuthFile: fixture.hostAuth,
+    });
+    const config = await readGeneratedConfig(prepared.paths.configHome);
+
+    expect(Object.keys(config.agent)).toEqual(["ctb-plan", "ctb-engineer"]);
+    expect(config.agent["not-ctb"]).toBeUndefined();
+    expect(prepared.notes.join("\n")).toContain("Injected 2 native CTB agent definition(s)");
     await prepared.cleanup();
   });
 

@@ -56,7 +56,7 @@ import {
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
 } from "../services/index.js";
-import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
@@ -3723,7 +3723,8 @@ export function agentRoutes(
   router.post("/agents/:id/pause", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    if (!(await getAccessibleAgent(req, res, id))) {
+    const accessible = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+    if (!accessible) {
       return;
     }
     const agent = await svc.pause(id);
@@ -3749,7 +3750,7 @@ export function agentRoutes(
   router.post("/agents/:id/resume", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    const existing = await getAccessibleAgent(req, res, id);
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) {
       return;
     }
@@ -4523,6 +4524,43 @@ export function agentRoutes(
         await getCurrentUserRedactionOptions(),
       ),
     ));
+  });
+
+  router.get("/heartbeat-runs/:runId/runtime-state", async (req, res) => {
+    const runId = req.params.runId as string;
+    const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
+    if (!run) return;
+    const state = await heartbeat.getRunRuntimeState(runId);
+    if (!state) {
+      res.status(404).json({ error: "Heartbeat run not found" });
+      return;
+    }
+    res.json(state);
+  });
+
+  router.post("/heartbeat-runs/:runId/reconcile", async (req, res) => {
+    if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.runId) {
+      throw unauthorized("Agent run id required");
+    }
+    const runId = req.params.runId as string;
+    const target = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
+    if (!target) return;
+    if (target.agentId !== req.actor.agentId) {
+      throw forbidden("Agents may reconcile only their own runs");
+    }
+    const result = await heartbeat.reconcileRun(runId);
+    if (result.outcome === "RECONCILED") {
+      await logActivity(db, {
+        companyId: target.companyId,
+        actorType: "agent",
+        actorId: req.actor.agentId,
+        action: "heartbeat.reconciled",
+        entityType: "heartbeat_run",
+        entityId: target.id,
+        details: { reconciledByRunId: req.actor.runId },
+      });
+    }
+    res.json(result);
   });
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {

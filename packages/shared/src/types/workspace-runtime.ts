@@ -157,6 +157,28 @@ export interface ExecutionWorkspaceCloseReadiness {
   runtimeServices: WorkspaceRuntimeService[];
 }
 
+/** A non-branch-mutating delivery check after fetching the configured origin. */
+export interface ExecutionWorkspaceDeliveryPreparation {
+  workspaceId: string;
+  sourceIssueId: string | null;
+  branchName: string | null;
+  baseRef: string | null;
+  repoUrl: string | null;
+  headSha: string | null;
+  remoteBaseSha: string | null;
+  remoteHeadSha: string | null;
+  aheadCount: number | null;
+  behindCount: number | null;
+  hasDirtyFiles: boolean;
+  hasConflicts: boolean | null;
+  credentialConfigured: boolean;
+  credentialSource: "company_secret" | "server_env" | null;
+  credentialSecretName: string | null;
+  ready: boolean;
+  blockingReasons: string[];
+  warnings: string[];
+}
+
 export interface ProjectExecutionWorkspacePolicy {
   enabled: boolean;
   sharedWorkspaceConcurrency?: SharedWorkspaceConcurrency;

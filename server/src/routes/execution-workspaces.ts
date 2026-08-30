@@ -1,5 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import { Router, type Request, type Response } from "express";
+import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { issues, projects, projectWorkspaces } from "@paperclipai/db";
 import {
@@ -19,6 +20,7 @@ import {
   logActivity,
   workspaceOperationService,
   workspaceRuntimeLeaseService,
+  workProductService,
   LEASED_WORKSPACE_RUNTIME_ACTIONS,
   type WorkspaceRuntimeLeaseClaim,
 } from "../services/index.js";
@@ -43,10 +45,19 @@ import {
 import { assertCanManageExecutionWorkspaceRuntimeServices } from "./workspace-runtime-service-authz.js";
 import { appendWithCap } from "../adapters/utils.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
+import { githubPullRequestService } from "../services/github-pull-requests.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { runExclusiveWorkspaceRuntimeControl } from "../services/workspace-operations.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
+const createPullRequestSchema = z.object({
+  title: z.string().trim().min(1).max(256),
+  body: z.string().max(65_536).nullable().optional(),
+});
+const mergePullRequestSchema = z.object({
+  pullRequestNumber: z.number().int().positive(),
+  method: z.enum(["merge", "squash", "rebase"]).default("squash"),
+});
 
 export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: PluginWorkerManager } = {}) {
   const router = Router();
@@ -54,6 +65,8 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
   const access = accessService(db);
   const workspaceOperationsSvc = workspaceOperationService(db);
   const runtimeLeases = workspaceRuntimeLeaseService(db);
+  const workProducts = workProductService(db);
+  const pullRequests = githubPullRequestService(db);
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
@@ -137,6 +150,197 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       return;
     }
     res.json(readiness);
+  });
+
+  router.get("/execution-workspaces/:id/delivery", async (req, res) => {
+    const id = req.params.id as string;
+    const workspace = await getAccessibleResource(req, res, svc.getById(id), "Execution workspace not found");
+    if (!workspace) return;
+    if (!(await assertExecutionWorkspaceReadAllowed(req, res, workspace.companyId))) return;
+    const readiness = await svc.getCloseReadiness(id);
+    if (!readiness) {
+      res.status(404).json({ error: "Execution workspace not found" });
+      return;
+    }
+    res.json({ workspace, deliveryState: readiness.deliveryState, git: readiness.git, closeReadiness: readiness });
+  });
+
+  router.post("/execution-workspaces/:id/prepare-delivery", async (req, res) => {
+    const id = req.params.id as string;
+    const workspace = await getAccessibleResource(req, res, svc.getById(id), "Execution workspace not found");
+    if (!workspace) return;
+    assertBoard(req);
+    if (!(await assertExecutionWorkspaceReadAllowed(req, res, workspace.companyId))) return;
+
+    const preparation = await svc.prepareDelivery(id);
+    if (!preparation) {
+      res.status(404).json({ error: "Execution workspace not found" });
+      return;
+    }
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: workspace.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "execution_workspace.delivery_prepared",
+      entityType: "execution_workspace",
+      entityId: workspace.id,
+      details: {
+        sourceIssueId: preparation.sourceIssueId,
+        branchName: preparation.branchName,
+        baseRef: preparation.baseRef,
+        headSha: preparation.headSha,
+        remoteBaseSha: preparation.remoteBaseSha,
+        remoteHeadSha: preparation.remoteHeadSha,
+        aheadCount: preparation.aheadCount,
+        behindCount: preparation.behindCount,
+        hasDirtyFiles: preparation.hasDirtyFiles,
+        hasConflicts: preparation.hasConflicts,
+        credentialConfigured: preparation.credentialConfigured,
+        ready: preparation.ready,
+      },
+    });
+    res.json(preparation);
+  });
+
+  router.post("/execution-workspaces/:id/pull-request", validate(createPullRequestSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const workspace = await getAccessibleResource(req, res, svc.getById(id), "Execution workspace not found");
+    if (!workspace) return;
+    assertBoard(req);
+    if (!(await assertExecutionWorkspaceReadAllowed(req, res, workspace.companyId))) return;
+    const preparation = await svc.prepareDelivery(id);
+    if (!preparation) {
+      res.status(404).json({ error: "Execution workspace not found" });
+      return;
+    }
+    if (!preparation.ready || !preparation.sourceIssueId || !preparation.branchName || !preparation.baseRef || !preparation.headSha) {
+      res.status(409).json({ error: "Workspace is not ready for pull request delivery", details: preparation.blockingReasons });
+      return;
+    }
+
+    const pullRequest = await pullRequests.create({
+      companyId: workspace.companyId,
+      issueId: preparation.sourceIssueId,
+      repoUrl: preparation.repoUrl,
+      head: preparation.branchName,
+      base: preparation.baseRef,
+      title: req.body.title,
+      body: req.body.body ?? null,
+    });
+    if (
+      pullRequest.headRef !== preparation.branchName
+      || pullRequest.headSha !== preparation.headSha
+      || pullRequest.baseRef !== preparation.baseRef
+    ) {
+      res.status(409).json({ error: "GitHub pull request does not match the prepared workspace branch and SHA" });
+      return;
+    }
+    const workProduct = await workProducts.createForIssue(preparation.sourceIssueId, workspace.companyId, {
+      projectId: workspace.projectId,
+      executionWorkspaceId: workspace.id,
+      type: "pull_request",
+      provider: "github",
+      externalId: `${pullRequest.number}`,
+      title: pullRequest.title,
+      url: pullRequest.url,
+      status: "ready_for_review",
+      reviewState: "needs_board_review",
+      isPrimary: true,
+      healthStatus: "unknown",
+      summary: null,
+      metadata: {
+        owner: preparation.repoUrl,
+        number: pullRequest.number,
+        headRef: pullRequest.headRef,
+        headSha: pullRequest.headSha,
+        baseRef: pullRequest.baseRef,
+      },
+      createdByRunId: null,
+      runtimeServiceId: null,
+    });
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: workspace.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "execution_workspace.pull_request_created",
+      entityType: "execution_workspace",
+      entityId: workspace.id,
+      details: {
+        sourceIssueId: preparation.sourceIssueId,
+        pullRequestNumber: pullRequest.number,
+        headSha: preparation.headSha,
+        baseRef: preparation.baseRef,
+        workProductId: workProduct?.id ?? null,
+      },
+    });
+    res.status(201).json({ pullRequest, workProduct, preparation });
+  });
+
+  router.post("/execution-workspaces/:id/pull-request/merge", validate(mergePullRequestSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const workspace = await getAccessibleResource(req, res, svc.getById(id), "Execution workspace not found");
+    if (!workspace) return;
+    assertBoard(req);
+    if (!(await assertExecutionWorkspaceReadAllowed(req, res, workspace.companyId))) return;
+    const preparation = await svc.prepareDelivery(id);
+    if (!preparation) {
+      res.status(404).json({ error: "Execution workspace not found" });
+      return;
+    }
+    if (!preparation.ready || !preparation.sourceIssueId || !preparation.headSha) {
+      res.status(409).json({ error: "Workspace is not ready to merge its pull request", details: preparation.blockingReasons });
+      return;
+    }
+    const merge = await pullRequests.merge({
+      companyId: workspace.companyId,
+      issueId: preparation.sourceIssueId,
+      repoUrl: preparation.repoUrl,
+      number: req.body.pullRequestNumber,
+      expectedHeadSha: preparation.headSha,
+      method: req.body.method,
+    });
+    const products = await workProducts.listForIssue(preparation.sourceIssueId);
+    const workProduct = products.find((product) =>
+      product.type === "pull_request"
+      && product.provider === "github"
+      && product.externalId === String(req.body.pullRequestNumber),
+    ) ?? null;
+    if (workProduct) {
+      await workProducts.update(workProduct.id, {
+        status: "merged",
+        reviewState: "approved",
+        metadata: { ...(workProduct.metadata ?? {}), mergeCommitSha: merge.mergeCommitSha },
+      });
+    }
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: workspace.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "execution_workspace.pull_request_merged",
+      entityType: "execution_workspace",
+      entityId: workspace.id,
+      details: {
+        sourceIssueId: preparation.sourceIssueId,
+        pullRequestNumber: req.body.pullRequestNumber,
+        expectedHeadSha: preparation.headSha,
+        mergeMethod: req.body.method,
+        mergeCommitSha: merge.mergeCommitSha,
+        workProductId: workProduct?.id ?? null,
+      },
+    });
+    res.json({ merge, preparation, workProductId: workProduct?.id ?? null });
   });
 
   router.get("/execution-workspaces/:id/workspace-operations", async (req, res) => {

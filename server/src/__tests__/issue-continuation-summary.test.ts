@@ -3,6 +3,7 @@ import {
   ISSUE_CONTINUATION_SUMMARY_MAX_BODY_CHARS,
   buildContinuationSummaryMarkdown,
   continuationSummaryParksExecutor,
+  extractAcceptanceCriteriaSection,
   extractContinuationSummaryNextAction,
 } from "../services/issue-continuation-summary.js";
 
@@ -111,5 +112,74 @@ describe("issue continuation summaries", () => {
     ].join("\n");
 
     expect(continuationSummaryParksExecutor(body)).toBe(false);
+  });
+
+  it("preserves ACCEPTANCE / DOD sections that use non-canonical headings", () => {
+    const description = [
+      "## Context",
+      "",
+      "Storybook/shadcn continuation.",
+      "",
+      "## ACCEPTANCE / DOD",
+      "1. Build passes",
+      "2. Worker deployed",
+      "3. Production URL verified",
+    ].join("\n");
+
+    expect(extractAcceptanceCriteriaSection(description)).toContain("2. Worker deployed");
+  });
+
+  it("extracts acceptance criteria from Definition of Done and DOD headings", () => {
+    const dod = ["# DOD", "", "- All tests green", "- Docs updated"].join("\n");
+    expect(extractAcceptanceCriteriaSection(dod)).toContain("- All tests green");
+
+    const definition = [
+      "## Definition of Done",
+      "",
+      "- Deployed to production",
+      "",
+      "## Notes",
+      "",
+      "Follow up later",
+    ].join("\n");
+    expect(extractAcceptanceCriteriaSection(definition)).toContain("- Deployed to production");
+    expect(extractAcceptanceCriteriaSection("## Acceptance\n\nNone.")).toBeNull();
+  });
+
+  it("keeps explicit acceptance criteria out of the no-criteria fallback", () => {
+    const body = buildContinuationSummaryMarkdown({
+      issue: {
+        id: "issue-2",
+        identifier: "KOMAA-117",
+        title: "Storybook/shadcn continuation",
+        description: [
+          "## Objective",
+          "",
+          "Continue the component work.",
+          "",
+          "## ACCEPTANCE / DOD",
+          "1. Registry validated",
+          "2. Storybook story added",
+        ].join("\n"),
+        status: "in_progress",
+        priority: "high",
+      },
+      run: {
+        id: "run-3",
+        status: "failed",
+        error: "process lost",
+        errorCode: "process_lost",
+        resultJson: null,
+      },
+      agent: {
+        id: "agent-2",
+        name: "Designer",
+        adapterType: "opencode_local",
+      },
+    });
+
+    expect(body).not.toContain("No explicit acceptance criteria captured.");
+    expect(body).toContain("1. Registry validated");
+    expect(body).toContain("2. Storybook story added");
   });
 });

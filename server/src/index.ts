@@ -1166,6 +1166,11 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
+        const finalizedRuns = await heartbeat.reconcileFinalizingRuns();
+        if (finalizedRuns.reconciled > 0) {
+          logger.warn({ ...finalizedRuns }, "startup run finalization reconciled runs stuck in finalizing");
+        }
+
         const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
         if (issueGraphReconciled.escalationsCreated > 0 || issueGraphReconciled.dependencyWakesHealed > 0) {
           logger.warn(
@@ -1408,6 +1413,12 @@ export async function startServer(): Promise<StartedServer> {
               const reviewed = await heartbeat.reconcileProductivityReviews();
               if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
                 logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
+              }
+            })
+            .then(async () => {
+              const finalized = await heartbeat.reconcileFinalizingRuns();
+              if (finalized.reconciled > 0) {
+                logger.warn({ ...finalized }, "periodic run finalization reconciled runs stuck in finalizing");
               }
             })
             .catch((err) => {

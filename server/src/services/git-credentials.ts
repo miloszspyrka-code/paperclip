@@ -39,6 +39,8 @@ export type GitCredential = {
   secretName: string | null;
 };
 
+export type GitHubApiCredential = Pick<GitCredential, "token" | "source" | "secretName">;
+
 /** A prepared, credential-bearing git invocation: config args plus the env that carries the token. */
 export type GitAuthInvocation = {
   configArgs: string[];
@@ -200,4 +202,30 @@ export function createGitRemoteAuthProvider(
     if (!credential) return null;
     return buildGitAuthInvocation(credential);
   };
+}
+
+/**
+ * Resolve the same company-scoped GitHub credential used by managed git operations for
+ * GitHub's HTTP API. Callers must keep `token` in-memory and must never return it.
+ */
+export async function resolveGitHubApiCredential(
+  db: Db,
+  companyId: string,
+  context?: {
+    issueId?: string | null;
+    heartbeatRunId?: string | null;
+    responsibleUserId?: string | null;
+  },
+  deps?: {
+    secrets?: GitCredentialSecretsDeps;
+    env?: NodeJS.ProcessEnv;
+    secretNames?: readonly string[];
+  },
+): Promise<GitHubApiCredential | null> {
+  const provider = createGitRemoteAuthProvider(db, companyId, context, deps);
+  const invocation = await provider("https://github.com/");
+  const token = invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]?.trim() || null;
+  return token
+    ? { token, source: invocation!.source, secretName: invocation!.secretName }
+    : null;
 }

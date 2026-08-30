@@ -1368,6 +1368,39 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(checkoutReleasedIssue?.checkoutRunId).toBeNull();
   });
 
+  it("reconciles a dead OpenCode child only when its external MCP profile is known empty", async () => {
+    const { runId, issueId } = await seedRunFixture({
+      adapterType: "opencode_local",
+      agentStatus: "idle",
+      processPid: 999_999_999,
+      contextSnapshot: { paperclipRuntimeMcp: [] },
+    });
+    const heartbeat = heartbeatService(db);
+
+    expect((await heartbeat.getRunRuntimeState(runId))?.recommendedDisposition).toBe("reconcile");
+    expect((await heartbeat.reconcileRun(runId)).outcome).toBe("RECONCILED");
+
+    const run = await heartbeat.getRun(runId);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(run).toMatchObject({ status: "failed", errorCode: "process_lost" });
+    expect(issue?.executionRunId).not.toBe(runId);
+    expect(issue?.checkoutRunId).not.toBe(runId);
+  });
+
+  it("does not reconcile a dead OpenCode child with external MCP write uncertainty", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "opencode_local",
+      agentStatus: "idle",
+      processPid: 999_999_999,
+      contextSnapshot: { paperclipRuntimeMcp: [{ connectionId: "external-connection" }] },
+    });
+    const heartbeat = heartbeatService(db);
+
+    expect((await heartbeat.getRunRuntimeState(runId))?.recommendedDisposition).toBe("manual_review");
+    expect((await heartbeat.reconcileRun(runId)).outcome).toBe("NO_ACTION");
+    expect(await heartbeat.getRun(runId)).toMatchObject({ status: "running" });
+  });
+
   it("restores one lost monitor dispatch before escalating a second process loss", async () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
       adapterType: "openclaw_gateway",

@@ -78,6 +78,22 @@ function extractMarkdownSection(markdown: string | null | undefined, heading: st
   return section ? truncateText(section, SUMMARY_SECTION_MAX_CHARS) : null;
 }
 
+const ACCEPTANCE_SECTION_RE =
+  /^[ \t]*#{1,6}[ \t]+(?:acceptance[^\n:]*|definition of done[^\n:]*|dod[^\n:]*)[ \t]*:?[\t ]*(?:\r?\n|$)([\s\S]*?)(?=^[ \t]*#{1,6}[ \t]|\s*(?![\s\S]))/gim;
+
+export function extractAcceptanceCriteriaSection(markdown: string | null | undefined) {
+  if (!markdown) return null;
+  ACCEPTANCE_SECTION_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = ACCEPTANCE_SECTION_RE.exec(markdown)) !== null) {
+    const section = match[1]?.trim();
+    if (!section) continue;
+    if (/^none\.?$/i.test(section)) continue;
+    return truncateText(section, SUMMARY_SECTION_MAX_CHARS);
+  }
+  return null;
+}
+
 function extractPathCandidates(...texts: Array<string | null | undefined>) {
   const seen = new Set<string>();
   for (const text of texts) {
@@ -151,7 +167,10 @@ export function buildContinuationSummaryMarkdown(input: {
 
   const paths = extractPathCandidates(resultSummary, run.stdoutExcerpt, run.stderrExcerpt, input.previousSummaryBody);
   const objective = extractMarkdownSection(issue.description, "Objective") ?? issue.description?.trim() ?? "No objective captured.";
-  const acceptanceCriteria = extractMarkdownSection(issue.description, "Acceptance Criteria") ?? "No explicit acceptance criteria captured.";
+  const acceptanceCriteria =
+    extractAcceptanceCriteriaSection(issue.description) ??
+    extractMarkdownSection(issue.description, "Acceptance Criteria") ??
+    "No explicit acceptance criteria captured.";
   const mode = inferMode(issue, run);
   const nextAction = inferNextAction(issue, run, extractPreviousNextAction(input.previousSummaryBody));
 

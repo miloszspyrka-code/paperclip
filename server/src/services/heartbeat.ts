@@ -26,6 +26,10 @@ import {
   type RoutineRevisionSnapshotV1,
   type RunLivenessState,
   type SourceTrustMetadata,
+  type ToolConnection,
+  type ToolConnectionStatus,
+  type ToolConnectionTransport,
+  type ToolProfileEffectiveSummary,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -432,6 +436,12 @@ const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_r
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+// Non-terminal state used while the adapter result is being persisted. It
+// separates "the model executed" from "the terminal outcome was stored" so a
+// terminal write failure is never misclassified as an adapter/model execution
+// failure (which would otherwise trigger a duplicate model invocation).
+const HEARTBEAT_RUN_FINALIZING_STATUSES = ["finalizing"] as const;
+export const HEARTBEAT_RUN_FINALIZATION_FAILED_ERROR_CODE = "finalization_failed";
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
@@ -2529,8 +2539,37 @@ function redactInlineBase64ImageData(chunk: string) {
   );
 }
 
+/**
+ * Deterministically strip invalid UTF-16 (lone surrogate code units) from text
+ * before it is persisted. The postgres `text` columns expect valid UTF-8; a lone
+ * surrogate cannot be encoded and would abort the whole persistence write. Valid
+ * Unicode (including Polish diacritics and paired surrogates) is preserved
+ * verbatim. This is a defensive, lossy-only-on-broken-input sanitizer: correct
+ * content is never altered.
+ */
+export function sanitizePersistedText(text: string): string {
+  if (typeof text !== "string" || text.length === 0) return text;
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out += text[i] + text[i + 1];
+        i++;
+      }
+      // Lone high surrogate: drop it.
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      // Lone low surrogate: drop it.
+    } else {
+      out += text[i];
+    }
+  }
+  return out;
+}
+
 export function compactRunLogChunk(chunk: string, maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS) {
-  const normalized = redactSensitiveText(redactInlineBase64ImageData(chunk));
+  const normalized = sanitizePersistedText(redactSensitiveText(redactInlineBase64ImageData(chunk)));
   if (normalized.length <= maxChars) return normalized;
 
   const headChars = Math.max(0, Math.floor(maxChars * 0.6));
@@ -3287,10 +3326,78 @@ export async function revokeHeartbeatRunGatewayTokens(input: {
     ));
 }
 
+/**
+ * Pure decision logic for exactly which Paperclip-managed MCP Connections are
+ * exposed to a heartbeat run. Exposure is the intersection of profile
+ * permission and an install/task-scope grant; `permitted` alone never implies
+ * `exposedThisExecution`. The function is DB-free so it can be unit tested and
+ * reused by both the server builder and the session-identity builder.
+ */
+export interface RuntimeMcpConnectionDecision {
+  connectionId: string;
+  name: string;
+  permitted: boolean;
+  installedEveryRun: boolean;
+  availableOnDemand: boolean;
+  taskScoped: boolean;
+  exposedThisExecution: boolean;
+  activationSource: "installed" | "task_scoped" | "profile_permitted_only";
+}
+
+export interface RuntimeMcpCandidateConnection {
+  id: string;
+  name: string;
+  transport: ToolConnectionTransport;
+  status?: ToolConnectionStatus | null;
+  enabled?: boolean | null;
+}
+
+export function resolveExposedRuntimeMcpConnections(input: {
+  effective: ToolProfileEffectiveSummary;
+  candidateConnections: RuntimeMcpCandidateConnection[];
+  taskScopedConnectionIds?: Set<string> | null;
+}): RuntimeMcpConnectionDecision[] {
+  const { effective, candidateConnections, taskScopedConnectionIds } = input;
+  const permittedConnectionIds = new Set([
+    ...effective.entries
+      .filter((entry) => entry.effect === "include" && entry.connectionId)
+      .map((entry) => entry.connectionId!),
+    ...effective.allowedTools.map((tool) => tool.connectionId),
+  ]);
+  const installedConnectionIds = new Set(effective.installedConnections.map((connection) => connection.id));
+  const taskScoped = input.taskScopedConnectionIds ?? new Set<string>();
+  return input.candidateConnections.map((connection) => {
+    const permitted = permittedConnectionIds.has(connection.id);
+    const installedEveryRun = installedConnectionIds.has(connection.id);
+    const taskScopedFlag = taskScoped.has(connection.id);
+    const runtimeEligible = connection.transport === "mcp_remote"
+      && connection.status === "active"
+      && connection.enabled === true;
+    const exposedThisExecution = permitted && (installedEveryRun || taskScopedFlag) && runtimeEligible;
+    const availableOnDemand = permitted && !installedEveryRun && !taskScopedFlag && connection.transport === "mcp_remote";
+    const activationSource: RuntimeMcpConnectionDecision["activationSource"] = taskScopedFlag
+      ? "task_scoped"
+      : installedEveryRun
+        ? "installed"
+        : "profile_permitted_only";
+    return {
+      connectionId: connection.id,
+      name: connection.name,
+      permitted,
+      installedEveryRun,
+      availableOnDemand,
+      taskScoped: taskScopedFlag,
+      exposedThisExecution,
+      activationSource,
+    };
+  });
+}
+
 export async function buildPaperclipRuntimeMcpServers(input: {
   db: Db;
   agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name">;
   runId: string;
+  taskScopedConnectionIds?: Set<string> | null;
 }): Promise<AdapterRuntimeMcpServer[]> {
   const effective = await toolAccessService(input.db).getEffectiveProfilesForAgent(
     input.agent.companyId,
@@ -3302,7 +3409,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       .map((entry) => entry.connectionId!),
     ...effective.allowedTools.map((tool) => tool.connectionId),
   ]);
-  const installedConnectionIds = new Set(effective.installedConnections.map((connection) => connection.id));
+  const installedConnectionById = new Map(effective.installedConnections.map((connection) => [connection.id, connection]));
   const permittedConnections = permittedConnectionIds.size > 0
     ? await input.db
       .select({
@@ -3316,16 +3423,31 @@ export async function buildPaperclipRuntimeMcpServers(input: {
         inArray(toolConnections.id, [...permittedConnectionIds]),
       ))
     : [];
-  const permittedNotInstalledConnections = permittedConnections
-    .filter((connection) => connection.transport === "mcp_remote" && !installedConnectionIds.has(connection.id))
-    .map(({ id, name }) => ({ id, name }))
+  const candidateConnections: RuntimeMcpCandidateConnection[] = [
+    ...effective.installedConnections,
+    ...permittedConnections
+      .filter((connection) => !installedConnectionById.has(connection.id))
+      .map((connection) => ({
+        id: connection.id,
+        name: connection.name,
+        transport: connection.transport,
+        status: undefined,
+        enabled: undefined,
+      })),
+  ];
+  const decisions = resolveExposedRuntimeMcpConnections({
+    effective,
+    candidateConnections,
+    taskScopedConnectionIds: input.taskScopedConnectionIds ?? null,
+  });
+  const permittedNotInstalledConnections = decisions
+    .filter((decision) => decision.availableOnDemand)
+    .map(({ connectionId, name }) => ({ id: connectionId, name }))
     .sort((a, b) => a.name.localeCompare(b.name));
-  const uniqueConnections = effective.installedConnections.filter((connection) =>
-    permittedConnectionIds.has(connection.id)
-    && connection.status === "active"
-    && connection.enabled
-    && connection.transport === "mcp_remote"
+  const exposedConnectionIds = new Set(
+    decisions.filter((decision) => decision.exposedThisExecution).map((decision) => decision.connectionId),
   );
+  const uniqueConnections = effective.installedConnections.filter((connection) => exposedConnectionIds.has(connection.id));
   const service = createToolGatewayService(input.db);
   if (uniqueConnections.length === 0) {
     await service.recordRuntimeMcpDeliveryDiagnostic({
@@ -3426,6 +3548,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
 export async function buildPaperclipRuntimeMcpIdentity(input: {
   db: Db;
   agent: Pick<typeof agents.$inferSelect, "id" | "companyId">;
+  taskScopedConnectionIds?: Set<string> | null;
 }): Promise<Array<{ connectionId: string; name: string }>> {
   const effective = await toolAccessService(input.db).getEffectiveProfilesForAgent(
     input.agent.companyId,
@@ -3437,14 +3560,40 @@ export async function buildPaperclipRuntimeMcpIdentity(input: {
       .map((entry) => entry.connectionId!),
     ...effective.allowedTools.map((tool) => tool.connectionId),
   ]);
-  return effective.installedConnections
-    .filter((connection) =>
-      permittedConnectionIds.has(connection.id)
-      && connection.status === "active"
-      && connection.enabled
-      && connection.transport === "mcp_remote",
-    )
-    .map((connection) => ({ connectionId: connection.id, name: connection.name }))
+  const installedConnectionById = new Map(effective.installedConnections.map((connection) => [connection.id, connection]));
+  const permittedConnections = permittedConnectionIds.size > 0
+    ? await input.db
+      .select({
+        id: toolConnections.id,
+        name: toolConnections.name,
+        transport: toolConnections.transport,
+      })
+      .from(toolConnections)
+      .where(and(
+        eq(toolConnections.companyId, input.agent.companyId),
+        inArray(toolConnections.id, [...permittedConnectionIds]),
+      ))
+    : [];
+  const candidateConnections: RuntimeMcpCandidateConnection[] = [
+    ...effective.installedConnections,
+    ...permittedConnections
+      .filter((connection) => !installedConnectionById.has(connection.id))
+      .map((connection) => ({
+        id: connection.id,
+        name: connection.name,
+        transport: connection.transport,
+        status: undefined,
+        enabled: undefined,
+      })),
+  ];
+  const decisions = resolveExposedRuntimeMcpConnections({
+    effective,
+    candidateConnections,
+    taskScopedConnectionIds: input.taskScopedConnectionIds ?? null,
+  });
+  return decisions
+    .filter((decision) => decision.exposedThisExecution)
+    .map((decision) => ({ connectionId: decision.connectionId, name: decision.name }))
     .sort((a, b) => a.connectionId.localeCompare(b.connectionId));
 }
 
@@ -3657,6 +3806,47 @@ export function mergeModelProfileAdapterConfig(input: {
     ...(input.modelProfile.adapterConfig ?? {}),
     ...(input.issueAdapterConfig ?? {}),
   };
+}
+
+export const PAPERCLIP_NATIVE_OPENCODE_AGENTS = [
+  "ctb-plan",
+  "ctb-executor",
+  "ctb-engineer",
+  "ctb-designer",
+  "ctb-ui-qa",
+  "ctb-cto-infra",
+] as const;
+
+/** Select the native OpenCode permission envelope from server-owned metadata. */
+export function resolvePaperclipOpenCodeNativeAgent(input: {
+  adapterType: string;
+  role?: string | null;
+  workMode?: string | null;
+  interactionOnly?: boolean;
+}): (typeof PAPERCLIP_NATIVE_OPENCODE_AGENTS)[number] | null {
+  if (input.adapterType !== "opencode_local") return null;
+  const workMode = String(input.workMode ?? "").trim().toLowerCase();
+  if (input.interactionOnly || workMode === "ask" || workMode === "planning") return "ctb-plan";
+
+  switch (String(input.role ?? "").trim().toLowerCase()) {
+    case "cto":
+    case "devops":
+    case "infrastructure":
+      return "ctb-cto-infra";
+    case "qa":
+    case "quality":
+    case "tester":
+      return "ctb-ui-qa";
+    case "designer":
+    case "design":
+      return "ctb-designer";
+    case "engineer":
+    case "engineering":
+    case "developer":
+      return "ctb-engineer";
+    default:
+      return "ctb-executor";
+  }
 }
 
 function modelProfileRunMetadata(
@@ -5951,12 +6141,38 @@ function isTrackedLocalChildProcessAdapter(adapterType: string) {
   return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
 }
 
-function isHeartbeatRunTerminalStatus(
+export function isHeartbeatRunTerminalStatus(
   status: string | null | undefined,
 ): status is (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number] {
   return HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
     status as (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
   );
+}
+
+export function isHeartbeatRunFinalizingStatus(
+  status: string | null | undefined,
+): status is (typeof HEARTBEAT_RUN_FINALIZING_STATUSES)[number] {
+  return HEARTBEAT_RUN_FINALIZING_STATUSES.includes(
+    status as (typeof HEARTBEAT_RUN_FINALIZING_STATUSES)[number],
+  );
+}
+
+/**
+ * Attach the durable finalization marker to the run's resultJson. This keeps the
+ * intended terminal status and the finalization error code alongside the adapter
+ * result so a later reconciliation pass can re-flip the run to its terminal state
+ * without re-invoking the model. No large log duplicates are stored here; the
+ * already-persisted run log is referenced by `logRef`/`logBytes`.
+ */
+export function mergePaperclipFinalize(
+  resultJson: Record<string, unknown> | null,
+  terminalStatus: string,
+  finalizationErrorCode: string | null,
+): Record<string, unknown> {
+  return {
+    ...(resultJson ?? {}),
+    paperclipFinalize: { terminalStatus, finalizationErrorCode },
+  };
 }
 
 export function buildHeartbeatRunStatusLiveEventPayload(
@@ -6350,6 +6566,19 @@ function isProcessAlive(pid: number | null | undefined) {
     if (code === "EPERM") return true;
     if (code === "ESRCH") return false;
     return false;
+  }
+}
+
+function getProcessLiveness(pid: number | null | undefined) {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return "unknown" as const;
+  try {
+    process.kill(pid, 0);
+    return "alive" as const;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "EPERM") return "alive" as const;
+    if (code === "ESRCH") return "dead" as const;
+    return "unknown" as const;
   }
 }
 
@@ -9043,6 +9272,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect,
   ): Promise<typeof heartbeatRuns.$inferSelect> {
     if (isHeartbeatRunTerminalStatus(run.status)) return run;
+    // A run that is past execution and only awaiting terminal persistence must
+    // not be clobbered by the lease-release teardown (which would mark it
+    // "interrupted"). Recovery reconciles the finalizing run instead.
+    if (isHeartbeatRunFinalizingStatus(run.status)) return run;
     if (run.status !== "running" && run.status !== "queued") return run;
 
     // Choose the terminal status that reflects the true outcome. When the issue
@@ -13453,7 +13686,93 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { swept: rows.length, destroyed, capped };
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function getRunRuntimeState(runId: string) {
+    const runWithAdapter = await db
+      .select({ run: heartbeatRuns, adapterType: agents.adapterType })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!runWithAdapter) return null;
+
+    const { run, adapterType } = runWithAdapter;
+    const [lockedIssue, activeLease] = await Promise.all([
+      db.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.companyId, run.companyId),
+        or(eq(issues.executionRunId, run.id), eq(issues.checkoutRunId, run.id)),
+      )).limit(1).then((rows) => rows[0] ?? null),
+      db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+        eq(environmentLeases.heartbeatRunId, run.id),
+        eq(environmentLeases.status, "active"),
+      )).limit(1).then((rows) => rows[0] ?? null),
+    ]);
+    const context = parseObject(run.contextSnapshot);
+    const sessionId = run.sessionIdAfter ?? run.sessionIdBefore ?? null;
+    const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+    const processPidState = tracksLocalChild ? getProcessLiveness(run.processPid) : "unknown";
+    const processPidAlive = processPidState === "alive";
+    const processGroupAlive = Boolean(tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId));
+    const inMemoryExecution = runningProcesses.has(run.id) || activeRunExecutions.has(run.id);
+    const runtimeMcp = context.paperclipRuntimeMcp;
+    const externalWriteUncertainty = Boolean(
+      run.externalRunId ||
+      sessionId ||
+      (adapterType === "opencode_local" && (!Array.isArray(runtimeMcp) || runtimeMcp.length > 0)),
+    );
+    const recoveryActionId = readNonEmptyString(context.recoveryActionId);
+    const canReconcile = run.status === "running" &&
+      adapterType === "opencode_local" &&
+      Boolean(run.processPid) &&
+      !run.processGroupId &&
+      processPidState === "dead" &&
+      !processPidAlive && !processGroupAlive && !inMemoryExecution && !externalWriteUncertainty;
+
+    return {
+      runId: run.id,
+      paperclipStatus: run.status,
+      process: {
+        tracked: tracksLocalChild,
+        pid: run.processPid,
+        groupId: run.processGroupId,
+        pidState: processPidState,
+        pidAlive: processPidAlive,
+        groupAlive: processGroupAlive,
+        inMemoryExecution,
+      },
+      openCodeSession: adapterType === "opencode_local"
+        ? { id: sessionId, state: sessionId ? "unknown" : "absent" }
+        : null,
+      executionLockHeld: Boolean(lockedIssue),
+      workspaceLeaseActive: Boolean(activeLease),
+      recoveryAction: recoveryActionId ? "active" : "none",
+      externalWriteUncertainty,
+      recommendedDisposition: canReconcile
+        ? "reconcile"
+        : run.status !== "running"
+          ? "terminal_or_not_running"
+          : inMemoryExecution || processPidAlive || processGroupAlive
+            ? "wait_for_live_execution"
+            : processPidState === "unknown" || Boolean(run.processGroupId)
+              ? "manual_review"
+            : externalWriteUncertainty
+              ? "manual_review"
+              : "no_action",
+    };
+  }
+
+  async function reconcileRun(runId: string) {
+    const state = await getRunRuntimeState(runId);
+    if (!state || state.recommendedDisposition !== "reconcile") {
+      return { outcome: "NO_ACTION" as const, state };
+    }
+    const result = await reapOrphanedRuns({ runId });
+    return {
+      outcome: result.runIds.includes(runId) ? "RECONCILED" as const : "NO_ACTION" as const,
+      state: await getRunRuntimeState(runId),
+    };
+  }
+
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; runId?: string }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
@@ -13466,7 +13785,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(eq(heartbeatRuns.status, "running"));
+      .where(and(
+         eq(heartbeatRuns.status, "running"),
+         opts?.runId ? eq(heartbeatRuns.id, opts.runId) : undefined,
+       ));
 
     const monitorIssueIds = [...new Set(activeRuns.flatMap(({ run }) => {
       const runContext = parseObject(run.contextSnapshot);
@@ -13503,6 +13825,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      const runContext = parseObject(run.contextSnapshot);
+      const runtimeMcp = runContext.paperclipRuntimeMcp;
+      const processPidState = tracksLocalChild ? getProcessLiveness(run.processPid) : "unknown";
+      // An explicit request is narrower than background reaping: Paperclip must
+      // have no session or external-write evidence before it finalizes the run.
+      if (opts?.runId && (
+        adapterType !== "opencode_local" ||
+        !run.processPid ||
+        run.processGroupId ||
+        processPidState !== "dead" ||
+        run.externalRunId ||
+        run.sessionIdBefore ||
+        run.sessionIdAfter ||
+        !Array.isArray(runtimeMcp) ||
+        runtimeMcp.length > 0
+      )) continue;
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (
@@ -13542,7 +13880,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      const runContext = parseObject(run.contextSnapshot);
       const monitorIssueId = readNonEmptyString(runContext.issueId);
       const monitorNextCheckAt = monitorIssueId
         ? monitorNextCheckAtByIssue.get(`${run.companyId}:${monitorIssueId}`)
@@ -13647,24 +13984,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
 
-    // Retry stranded pending_cleanup leases on the same tick. Isolate the sweep
-    // so its failure never hides the reaper result. The backoff equals the
-    // reaper staleness threshold.
-    try {
-      const sweep = await sweepPendingCleanupLeases({ backoffMs: staleThresholdMs });
-      if (sweep.destroyed > 0 || sweep.capped > 0) {
-        logger.warn(
-          { destroyed: sweep.destroyed, capped: sweep.capped, swept: sweep.swept },
-          "swept pending_cleanup environment leases",
+    // An explicit run reconciliation must not sweep unrelated leases.
+    if (!opts?.runId) {
+      // Retry stranded pending_cleanup leases on the same tick. Isolate the sweep
+      // so its failure never hides the reaper result. The backoff equals the
+      // reaper staleness threshold.
+      try {
+        const sweep = await sweepPendingCleanupLeases({ backoffMs: staleThresholdMs });
+        if (sweep.destroyed > 0 || sweep.capped > 0) {
+          logger.warn(
+            { destroyed: sweep.destroyed, capped: sweep.capped, swept: sweep.swept },
+            "swept pending_cleanup environment leases",
+          );
+        }
+      } catch {
+        // Log a constant errorKind only. The exception can carry a credential in
+        // its name, code, message, cause, or stack, so the sweep never reads it.
+        logger.error(
+          { errorKind: PENDING_CLEANUP_SWEEP_ERROR_KIND },
+          "pending_cleanup lease sweep failed",
         );
       }
-    } catch {
-      // Log a constant errorKind only. The exception can carry a credential in
-      // its name, code, message, cause, or stack, so the sweep never reads it.
-      logger.error(
-        { errorKind: PENDING_CLEANUP_SWEEP_ERROR_KIND },
-        "pending_cleanup lease sweep failed",
-      );
     }
 
     return { reaped: reaped.length, runIds: reaped };
@@ -13692,6 +14032,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function reconcileStrandedAssignedIssues() {
     return recovery.reconcileStrandedAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+  }
+
+  async function reconcileFinalizingRuns(opts?: { companyId?: string }): Promise<{ reconciled: number; terminalized: string[] }> {
+    const terminalized: string[] = [];
+    const rows = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
+          eq(heartbeatRuns.status, "finalizing"),
+        ),
+      );
+    for (const run of rows) {
+      const resultJson = parseObject(run.resultJson) as Record<string, unknown> | null;
+      const paperclipFinalize = (resultJson?.paperclipFinalize ?? null) as
+        | { terminalStatus?: string | null; errorCode?: string | null }
+        | null;
+      const terminalStatus = paperclipFinalize?.terminalStatus ?? null;
+      if (terminalStatus && isHeartbeatRunTerminalStatus(terminalStatus)) {
+        const write = await setRunStatusFromLive(run.id, terminalStatus, ["finalizing"], {
+          finishedAt: run.finishedAt ?? new Date(),
+          errorCode: paperclipFinalize?.errorCode ?? run.errorCode ?? null,
+          error: run.error ?? null,
+        });
+        if (write.updated) terminalized.push(run.id);
+        continue;
+      }
+      const write = await setRunStatusFromLive(run.id, "failed", ["finalizing"], {
+        finishedAt: run.finishedAt ?? new Date(),
+        errorCode: HEARTBEAT_RUN_FINALIZATION_FAILED_ERROR_CODE,
+        error: run.error ?? "run left in finalizing without a persisted terminal status",
+      });
+      if (write.updated) terminalized.push(run.id);
+    }
+    return { reconciled: terminalized.length, terminalized };
   }
 
   async function sweepStaleIssueLocks() {
@@ -14557,8 +14933,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       modelProfile: modelProfileApplication,
       issueAdapterConfig: issueAssigneeOverrides?.adapterConfig ?? null,
     });
-    const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig, selectedEnvironmentId);
-    const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
+    const resolvedNativeOpenCodeAgent = resolvePaperclipOpenCodeNativeAgent({
+      adapterType: agent.adapterType,
+      role: agent.role,
+      workMode: issueRef?.workMode ?? null,
+      interactionOnly: context.interactionOnly === true,
+    });
+    const effectiveMergedConfig = resolvedNativeOpenCodeAgent
+      ? { ...mergedConfig, agent: resolvedNativeOpenCodeAgent }
+      : mergedConfig;
+    const configSnapshot = buildExecutionWorkspaceConfigSnapshot(effectiveMergedConfig, selectedEnvironmentId);
+    const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(effectiveMergedConfig);
     const runScopedMentionedSkillKeys = await resolveRunScopedMentionedSkillKeys({
       db,
       companyId: agent.companyId,
@@ -14617,6 +15002,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       db,
       agent: { id: agent.id, companyId: agent.companyId },
     });
+    // Persist the effective external-MCP identity before execution so a later
+    // reconciliation can distinguish an empty profile from unknown history.
+    context.paperclipRuntimeMcp = runtimeMcpIdentity;
     let runtimeConfig: Record<string, unknown> = {
       ...effectiveResolvedConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
@@ -16266,34 +16654,68 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterResult.summary ?? null,
       );
 
-      const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
+      const persistedResultJsonWithFinalize = mergePaperclipFinalize(persistedResultJson, status, null);
+
+      // Phase A — persist the adapter result durably while the run is still in a
+      // non-terminal "finalizing" state. This separates "the model executed" from
+      // "the terminal outcome was stored". If this write fails, the adapter already
+      // succeeded; we must NOT classify it as adapter_failed and we must NOT run the
+      // model again — recovery reconciles the persisted outcome later.
+      const finalizeWrite = await setRunStatusFromLive(run.id, "finalizing", ["running"], {
         finishedAt: new Date(),
         error: runErrorMessage,
         errorCode: runErrorCode,
         exitCode: adapterResult.exitCode,
         signal: adapterResult.signal,
         usageJson,
-        resultJson: persistedResultJson,
+        resultJson: persistedResultJsonWithFinalize,
         sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
-        stdoutExcerpt,
-        stderrExcerpt,
+        stdoutExcerpt: sanitizePersistedText(stdoutExcerpt),
+        stderrExcerpt: sanitizePersistedText(stderrExcerpt),
         logBytes: logSummary?.bytes,
         logSha256: logSummary?.sha256,
         logCompressed: logSummary?.compressed ?? false,
       });
-      if (!persistedRunWrite.updated) {
+      if (!finalizeWrite.updated) {
         logger.info(
           {
             runId: run.id,
             attemptedStatus: status,
-            currentStatus: persistedRunWrite.run?.status ?? null,
+            currentStatus: finalizeWrite.run?.status ?? null,
           },
           "skipping late run finalization because the run already left running state",
         );
         return;
       }
 
-      let persistedRun = persistedRunWrite.run;
+      // Phase B — flip the run to its terminal status. This is the only step that
+      // makes the run terminal. If it fails (storage error) or another path already
+      // flipped it (CAS miss), record a finalization_failed marker and let recovery
+      // reconcile. The model is NEVER invoked again for this outcome.
+      const terminalWrite = await setRunStatusFromLive(run.id, status, ["finalizing"], {
+        finishedAt: finalizeWrite.run?.finishedAt ?? new Date(),
+      }).catch((flipErr) => {
+        logger.error({ err: flipErr, runId: run.id }, "heartbeat run terminal finalization flip failed");
+        return null;
+      });
+      if (!terminalWrite || !terminalWrite.updated) {
+        await setRunStatusFromLive(run.id, "finalizing", ["finalizing"], {
+          resultJson: mergePaperclipFinalize(
+            persistedResultJsonWithFinalize,
+            status,
+            HEARTBEAT_RUN_FINALIZATION_FAILED_ERROR_CODE,
+          ),
+        }).catch((markErr) => {
+          logger.warn({ err: markErr, runId: run.id }, "failed to record finalization_failed marker");
+        });
+        logger.error(
+          { runId: run.id, attemptedStatus: status },
+          "run left in finalizing state after terminal flip failure; recovery will reconcile without adapter retry",
+        );
+        return;
+      }
+
+      let persistedRun = terminalWrite.run;
       if (persistedRun) {
         persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
       }
@@ -16492,16 +16914,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       const failedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
-        error: message,
+        error: sanitizePersistedText(message),
         errorCode: failureErrorCode,
         finishedAt: new Date(),
         resultJson: mergeRunStopMetadataForAgent(agent, "failed", {
           errorCode: failureErrorCode,
-          errorMessage: message,
+          errorMessage: sanitizePersistedText(message),
           resultJson: workspaceValidationFailure?.resultJson ?? configurationIncompleteFailure?.resultJson ?? null,
         }),
-        stdoutExcerpt,
-        stderrExcerpt,
+        stdoutExcerpt: sanitizePersistedText(stdoutExcerpt),
+        stderrExcerpt: sanitizePersistedText(stderrExcerpt),
         logBytes: logSummary?.bytes,
         logSha256: logSummary?.sha256,
         logCompressed: logSummary?.compressed ?? false,
@@ -19433,6 +19855,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     reportRunActivity: clearDetachedRunWarning,
 
+    getRunRuntimeState,
+    reconcileRun,
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     reapOrphanedRuns,
@@ -19468,6 +19892,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     reconcileStrandedAssignedIssues,
+
+    reconcileFinalizingRuns,
 
     terminalizeRunOnLeaseRelease,
 

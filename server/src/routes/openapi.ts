@@ -853,6 +853,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/tool-connections/{connectionId}/grants/installations",
   "DELETE /api/tool-connections/{connectionId}/grants/{grantId}",
   "GET /api/tool-connections/{connectionId}/usage",
+  "GET /api/agents/{agentId}/tool-apps",
+  "GET /api/tool-app-bindings",
   "PATCH /api/tool-connections/{connectionId}",
   "DELETE /api/tool-connections/{connectionId}",
   "POST /api/tool-connections/{connectionId}/health-check",
@@ -4408,6 +4410,24 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/heartbeat-runs/{runId}/runtime-state",
+  tags: ["runs"],
+  summary: "Get reconciler-safe runtime state for a heartbeat run",
+  request: { params: z.object({ runId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/heartbeat-runs/{runId}/reconcile",
+  tags: ["runs"],
+  summary: "Safely reconcile a definitively lost OpenCode heartbeat run",
+  request: { params: z.object({ runId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/heartbeat-runs/{runId}/cancel",
   tags: ["runs"],
@@ -5230,6 +5250,48 @@ registry.registerPath({
   summary: "Check close-readiness of a workspace",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/execution-workspaces/{id}/delivery",
+  tags: ["execution-workspaces"],
+  summary: "Get delivery state and close-readiness for an execution workspace",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/execution-workspaces/{id}/prepare-delivery",
+  tags: ["execution-workspaces"],
+  summary: "Board-only fetch and delivery preflight without changing workspace branches",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/execution-workspaces/{id}/pull-request",
+  tags: ["execution-workspaces"],
+  summary: "Board-only create of a GitHub pull request from a prepared workspace",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(z.object({ title: z.string().min(1), body: z.string().nullable().optional() })),
+  },
+  responses: { 201: r.ok(), 401: r.unauthorized, 403: r.forbidden, 409: r.conflict, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/execution-workspaces/{id}/pull-request/merge",
+  tags: ["execution-workspaces"],
+  summary: "Board-only exact-SHA GitHub pull request merge",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(z.object({ pullRequestNumber: z.number().int().positive(), method: z.enum(["merge", "squash", "rebase"]).optional() })),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 409: r.conflict, 422: r.unprocessable },
 });
 
 registry.registerPath({
@@ -7084,6 +7146,22 @@ registerCurrentRoute({
   path: "/api/tool-connections/{connectionId}/usage",
   tags: ["tool-access"],
   summary: "Get tool connection usage",
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/agents/{agentId}/tool-apps",
+  tags: ["tool-access"],
+  summary: "Get safe App/MCP assignments for an agent",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/tool-app-bindings",
+  tags: ["tool-access"],
+  summary: "List safe App/MCP assignment bindings",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registerCurrentRoute({

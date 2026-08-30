@@ -7,6 +7,7 @@ import {
   mergeModelProfileAdapterConfig,
   normalizeModelProfileWakeContext,
   resolveModelProfileApplication,
+  resolvePaperclipOpenCodeNativeAgent,
   isConfigurationIncompleteFailedRun,
 } from "../services/heartbeat.ts";
 
@@ -153,5 +154,28 @@ describe("heartbeat model profile application", () => {
   it("treats model resolution failures as non-retryable configuration failures", () => {
     expect(isConfigurationIncompleteFailedRun({ errorCode: "model_not_found" })).toBe(true);
     expect(isConfigurationIncompleteFailedRun({ errorCode: "provider_quota" })).toBe(false);
+  });
+
+  it("selects the native OpenCode permission envelope from server-owned metadata", () => {
+    expect(resolvePaperclipOpenCodeNativeAgent({
+      adapterType: "opencode_local",
+      role: "engineer",
+      workMode: "standard",
+    })).toBe("ctb-engineer");
+    expect(resolvePaperclipOpenCodeNativeAgent({
+      adapterType: "opencode_local",
+      role: "cto",
+      workMode: "standard",
+    })).toBe("ctb-cto-infra");
+    expect(resolvePaperclipOpenCodeNativeAgent({
+      adapterType: "opencode_local",
+      role: "engineer",
+      workMode: "planning",
+    })).toBe("ctb-plan");
+    expect(resolvePaperclipOpenCodeNativeAgent({
+      adapterType: "claude_local",
+      role: "engineer",
+      workMode: "standard",
+    })).toBeNull();
   });
 });

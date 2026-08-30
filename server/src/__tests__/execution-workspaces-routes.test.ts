@@ -10,6 +10,7 @@ const mockExecutionWorkspaceService = vi.hoisted(() => ({
   listSummaries: vi.fn(),
   getById: vi.fn(),
   getCloseReadiness: vi.fn(),
+  prepareDelivery: vi.fn(),
   archiveWorkspaceUnderLifecycleLock: vi.fn(),
   fenceClosedWorkspaceDestruction: vi.fn(),
   reconcileExecutionWorkspaceBranch: vi.fn(),
@@ -35,6 +36,15 @@ const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+const mockWorkProductService = vi.hoisted(() => ({
+  createForIssue: vi.fn(),
+  listForIssue: vi.fn(),
+  update: vi.fn(),
+}));
+const mockGithubPullRequestService = vi.hoisted(() => ({
+  create: vi.fn(),
+  merge: vi.fn(),
+}));
 
 const mockEnvironmentRuntimeService = vi.hoisted(() => ({
   destroyReusableSandboxLeases: vi.fn(async () => undefined),
@@ -47,11 +57,16 @@ vi.mock("../services/index.js", () => ({
   logActivity: mockLogActivity,
   workspaceOperationService: () => mockWorkspaceOperationService,
   workspaceRuntimeLeaseService: () => mockWorkspaceRuntimeLeaseService,
+  workProductService: () => mockWorkProductService,
   LEASED_WORKSPACE_RUNTIME_ACTIONS: ["start", "stop", "restart"],
 }));
 
 vi.mock("../services/environment-runtime.js", () => ({
   environmentRuntimeService: () => mockEnvironmentRuntimeService,
+}));
+
+vi.mock("../services/github-pull-requests.js", () => ({
+  githubPullRequestService: () => mockGithubPullRequestService,
 }));
 
 const mockWorkspaceRuntimeTeardown = vi.hoisted(() => ({
@@ -116,6 +131,7 @@ describe.sequential("execution workspace routes", () => {
     mockExecutionWorkspaceService.getById.mockResolvedValue(null);
     mockExecutionWorkspaceService.reconcileExecutionWorkspaceBranch.mockResolvedValue(null);
     mockHeartbeatService.wakeup.mockResolvedValue(null);
+    mockWorkProductService.listForIssue.mockResolvedValue([]);
   });
 
   it("uses summary mode for lightweight workspace lookups", async () => {
@@ -258,6 +274,218 @@ describe.sequential("execution workspace routes", () => {
         auditCommentId: "comment-1",
         recoveryActionId: "recovery-1",
       }),
+    }));
+  });
+
+  it("returns delivery state through the company-scoped read route", async () => {
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      sourceIssueId: "issue-1",
+    });
+    mockExecutionWorkspaceService.getCloseReadiness.mockResolvedValue({
+      deliveryState: "unmerged",
+      git: { branchName: "feature/delivery" },
+      state: "blocked",
+    });
+
+    const res = await request(createApp()).get("/api/execution-workspaces/workspace-1/delivery");
+
+    expect(res.status).toBe(200);
+    expect(res.body.deliveryState).toBe("unmerged");
+    expect(mockExecutionWorkspaceService.getCloseReadiness).toHaveBeenCalledWith("workspace-1");
+  });
+
+  it("rejects agents before fetching origin for delivery preparation", async () => {
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      sourceIssueId: "issue-1",
+    });
+
+    const res = await request(createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_jwt",
+      runId: "run-1",
+    })).post("/api/execution-workspaces/workspace-1/prepare-delivery");
+
+    expect(res.status).toBe(403);
+    expect(mockExecutionWorkspaceService.prepareDelivery).not.toHaveBeenCalled();
+  });
+
+  it("logs a board delivery preparation without credential metadata", async () => {
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      sourceIssueId: "issue-1",
+    });
+    mockExecutionWorkspaceService.prepareDelivery.mockResolvedValue({
+      workspaceId: "workspace-1",
+      sourceIssueId: "issue-1",
+      branchName: "feature/delivery",
+      baseRef: "main",
+      headSha: "head-sha",
+      remoteBaseSha: "base-sha",
+      remoteHeadSha: "head-sha",
+      aheadCount: 1,
+      behindCount: 0,
+      hasDirtyFiles: false,
+      hasConflicts: false,
+      credentialConfigured: true,
+      credentialSource: "company_secret",
+      credentialSecretName: "GITHUB_TOKEN",
+      ready: true,
+      blockingReasons: [],
+      warnings: [],
+    });
+
+    const res = await request(createApp()).post("/api/execution-workspaces/workspace-1/prepare-delivery");
+
+    expect(res.status).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "execution_workspace.delivery_prepared",
+      details: expect.not.objectContaining({ credentialSecretName: expect.anything() }),
+    }));
+  });
+
+  it.each([
+    ["/api/execution-workspaces/workspace-1/pull-request", { title: "Deliver workspace" }],
+    ["/api/execution-workspaces/workspace-1/pull-request/merge", { pullRequestNumber: 42 }],
+  ])("rejects agents before %s delivery mutations", async (path, body) => {
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      sourceIssueId: "issue-1",
+    });
+
+    const res = await request(createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_jwt",
+      runId: "run-1",
+    })).post(path).send(body);
+
+    expect(res.status).toBe(403);
+    expect(mockExecutionWorkspaceService.prepareDelivery).not.toHaveBeenCalled();
+    expect(mockGithubPullRequestService.create).not.toHaveBeenCalled();
+    expect(mockGithubPullRequestService.merge).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["/api/execution-workspaces/workspace-1/pull-request", { title: "Deliver workspace" }],
+    ["/api/execution-workspaces/workspace-1/pull-request/merge", { pullRequestNumber: 42 }],
+  ])("fails closed when %s preflight is blocked", async (path, body) => {
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      sourceIssueId: "issue-1",
+    });
+    mockExecutionWorkspaceService.prepareDelivery.mockResolvedValue({
+      ready: false,
+      sourceIssueId: "issue-1",
+      headSha: "head-sha",
+      blockingReasons: ["Workspace contains uncommitted changes."],
+    });
+
+    const res = await request(createApp()).post(path).send(body);
+
+    expect(res.status).toBe(409);
+    expect(res.body.details).toEqual(["Workspace contains uncommitted changes."]);
+    expect(mockGithubPullRequestService.create).not.toHaveBeenCalled();
+    expect(mockGithubPullRequestService.merge).not.toHaveBeenCalled();
+  });
+
+  it("creates a prepared pull request, persists its delivery work product, and audits the action", async () => {
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      projectId: "project-1",
+      sourceIssueId: "issue-1",
+    });
+    mockExecutionWorkspaceService.prepareDelivery.mockResolvedValue({
+      ready: true,
+      sourceIssueId: "issue-1",
+      repoUrl: "https://github.com/acme/repo.git",
+      branchName: "feature/delivery",
+      baseRef: "main",
+      headSha: "head-sha",
+      blockingReasons: [],
+    });
+    mockGithubPullRequestService.create.mockResolvedValue({
+      number: 42,
+      url: "https://github.com/acme/repo/pull/42",
+      title: "Deliver workspace",
+      state: "open",
+      headRef: "feature/delivery",
+      headSha: "head-sha",
+      baseRef: "main",
+      mergeCommitSha: null,
+    });
+    mockWorkProductService.createForIssue.mockResolvedValue({ id: "work-product-1" });
+
+    const res = await request(createApp())
+      .post("/api/execution-workspaces/workspace-1/pull-request")
+      .send({ title: "Deliver workspace" });
+
+    expect(res.status).toBe(201);
+    expect(mockGithubPullRequestService.create).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: "company-1",
+      issueId: "issue-1",
+      head: "feature/delivery",
+      base: "main",
+    }));
+    expect(mockWorkProductService.createForIssue).toHaveBeenCalledWith("issue-1", "company-1", expect.objectContaining({
+      type: "pull_request",
+      executionWorkspaceId: "workspace-1",
+      externalId: "42",
+    }));
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "execution_workspace.pull_request_created",
+    }));
+  });
+
+  it("marks a merged pull request work product and audits the verified merge", async () => {
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      sourceIssueId: "issue-1",
+    });
+    mockExecutionWorkspaceService.prepareDelivery.mockResolvedValue({
+      ready: true,
+      sourceIssueId: "issue-1",
+      repoUrl: "https://github.com/acme/repo.git",
+      headSha: "head-sha",
+      blockingReasons: [],
+    });
+    mockGithubPullRequestService.merge.mockResolvedValue({
+      merged: true,
+      mergeCommitSha: "merge-sha",
+      message: "GitHub confirmed the pull request merge.",
+    });
+    mockWorkProductService.listForIssue.mockResolvedValue([
+      { id: "work-product-1", type: "pull_request", provider: "github", externalId: "42", metadata: {} },
+    ]);
+
+    const res = await request(createApp())
+      .post("/api/execution-workspaces/workspace-1/pull-request/merge")
+      .send({ pullRequestNumber: 42, method: "squash" });
+
+    expect(res.status).toBe(200);
+    expect(mockGithubPullRequestService.merge).toHaveBeenCalledWith(expect.objectContaining({
+      number: 42,
+      expectedHeadSha: "head-sha",
+      method: "squash",
+    }));
+    expect(mockWorkProductService.update).toHaveBeenCalledWith("work-product-1", expect.objectContaining({
+      status: "merged",
+      reviewState: "approved",
+      metadata: expect.objectContaining({ mergeCommitSha: "merge-sha" }),
+    }));
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "execution_workspace.pull_request_merged",
     }));
   });
 

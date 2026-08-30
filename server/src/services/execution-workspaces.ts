@@ -22,6 +22,7 @@ import type {
   ExecutionWorkspaceCloseAction,
   ExecutionWorkspaceCloseGitReadiness,
   ExecutionWorkspaceCloseReadiness,
+  ExecutionWorkspaceDeliveryPreparation,
   ExecutionWorkspaceConfig,
   WorkspaceOverviewResponse,
   WorkspaceOverviewItem,
@@ -1395,6 +1396,114 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     return toExecutionWorkspace(row, runtimeServices, assessment.deliveryState);
   }
 
+  async function prepareDelivery(id: string): Promise<ExecutionWorkspaceDeliveryPreparation | null> {
+    const row = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, id))
+      .then((rows) => rows[0] ?? null);
+    if (!row) return null;
+
+    const workspace = toExecutionWorkspace(row);
+    const { git, warnings } = await inspectGitCloseReadiness(workspace);
+    const blockingReasons: string[] = [];
+    const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+    const branchName = git?.branchName ?? workspace.branchName;
+    const baseRef = workspace.baseRef;
+    let headSha: string | null = null;
+    let remoteBaseSha: string | null = null;
+    let remoteHeadSha: string | null = null;
+    let aheadCount: number | null = null;
+    let behindCount: number | null = null;
+    let hasConflicts: boolean | null = null;
+    let credentialConfigured = false;
+    let credentialSource: ExecutionWorkspaceDeliveryPreparation["credentialSource"] = null;
+    let credentialSecretName: string | null = null;
+
+    if (!row.sourceIssueId) blockingReasons.push("This workspace has no source issue to deliver.");
+    if (!workspacePath || !git?.repoRoot) blockingReasons.push("Paperclip could not inspect a local git worktree for this workspace.");
+    if (!branchName) blockingReasons.push("This workspace has no delivery branch.");
+    if (!baseRef) blockingReasons.push("This workspace has no base ref.");
+    if (git?.hasDirtyTrackedFiles || git?.hasUntrackedFiles) {
+      blockingReasons.push("Commit or remove all tracked and untracked workspace changes before delivery.");
+    }
+
+    if (workspacePath && git?.repoRoot && branchName && baseRef) {
+      const remoteUrl = await readGitStdout(["remote", "get-url", "origin"], workspacePath).catch(() => null);
+      const resolveGitAuth = createGitRemoteAuthProvider(db, row.companyId, { issueId: row.sourceIssueId });
+      const auth = remoteUrl ? await resolveGitAuth(remoteUrl) : null;
+      credentialConfigured = Boolean(auth);
+      credentialSource = auth?.source ?? null;
+      credentialSecretName = auth?.secretName ?? null;
+
+      if (!remoteUrl) {
+        blockingReasons.push("This workspace has no origin remote to prepare for delivery.");
+      } else if (!auth) {
+        blockingReasons.push("No supported GitHub credential is configured for this workspace origin.");
+      } else {
+        try {
+          await execFileAsync("git", ["-C", workspacePath, ...auth.configArgs, "fetch", "--no-tags", "origin", baseRef], {
+            cwd: workspacePath,
+            env: { ...process.env, ...auth.env, GIT_TERMINAL_PROMPT: "0" },
+          });
+        } catch {
+          blockingReasons.push("Paperclip could not fetch the delivery base from origin with the configured credential.");
+        }
+      }
+
+      headSha = await readGitStdout(["rev-parse", "HEAD"], workspacePath).catch(() => null);
+      remoteBaseSha = await readGitStdout(["rev-parse", "--verify", `origin/${baseRef}^{commit}`], workspacePath).catch(() => null);
+      remoteHeadSha = await readGitStdout(["rev-parse", "--verify", `origin/${branchName}^{commit}`], workspacePath).catch(() => null);
+
+      if (!headSha || !remoteBaseSha) {
+        blockingReasons.push("Paperclip could not resolve the workspace HEAD and remote base commit.");
+      } else {
+        const counts = await readGitStdout(["rev-list", "--left-right", "--count", `origin/${baseRef}...HEAD`], workspacePath).catch(() => null);
+        const [behindRaw, aheadRaw] = counts?.split(/\s+/) ?? [];
+        behindCount = behindRaw ? Number.parseInt(behindRaw, 10) : null;
+        aheadCount = aheadRaw ? Number.parseInt(aheadRaw, 10) : null;
+        if (behindCount !== null && behindCount > 0) {
+          blockingReasons.push("The delivery branch is behind the fetched origin base.");
+        }
+        if (remoteHeadSha && remoteHeadSha !== headSha) {
+          blockingReasons.push("The origin delivery branch does not match the local workspace HEAD.");
+        }
+        try {
+          await runGit(["merge-tree", "--write-tree", remoteBaseSha, headSha], workspacePath);
+          hasConflicts = false;
+        } catch (error) {
+          const code = typeof error === "object" && error && "code" in error
+            ? (error as { code?: unknown }).code
+            : null;
+          hasConflicts = code === 1 ? true : null;
+          if (hasConflicts) blockingReasons.push("The delivery branch conflicts with the fetched origin base.");
+          else warnings.push("Paperclip could not determine whether the delivery branch conflicts with origin base.");
+        }
+      }
+    }
+
+    return {
+      workspaceId: row.id,
+      sourceIssueId: row.sourceIssueId,
+      branchName,
+      baseRef,
+      repoUrl: row.repoUrl,
+      headSha,
+      remoteBaseSha,
+      remoteHeadSha,
+      aheadCount,
+      behindCount,
+      hasDirtyFiles: Boolean(git?.hasDirtyTrackedFiles || git?.hasUntrackedFiles),
+      hasConflicts,
+      credentialConfigured,
+      credentialSource,
+      credentialSecretName,
+      ready: blockingReasons.length === 0 && hasConflicts === false,
+      blockingReasons,
+      warnings,
+    };
+  }
+
   async function workspaceHasActiveRun(workspace: Pick<ExecutionWorkspaceRow, "id" | "companyId" | "sourceIssueId">) {
     const linkedIssues = await db
       .select({
@@ -2405,6 +2514,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         runtimeServices,
       };
     },
+
+    prepareDelivery,
 
     sweepTerminalWorkspaces: async (limit = 50) => {
       // Skip this sweep while another sweep runs. A concurrent sweep would share

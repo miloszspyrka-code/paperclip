@@ -86,9 +86,22 @@ import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js"
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
-export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
-export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
-export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
+// Liveness thresholds for silent active runs. Defaults are deliberately short:
+// an agent run that produces no output/tool/file progress for 10 minutes is
+// far more likely wedged than thinking. Override via env when a deployment
+// legitimately runs longer silent jobs.
+export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = Math.max(
+  60_000,
+  Number(process.env.ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS) || 10 * 60 * 1000,
+);
+export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = Math.max(
+  2 * 60_000,
+  Number(process.env.ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS) || 30 * 60 * 1000,
+);
+export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = Math.max(
+  60_000,
+  Number(process.env.ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS) || 30 * 60 * 1000,
+);
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
@@ -368,6 +381,14 @@ const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
+
+// Company-wide circuit breaker for transient infrastructure failures. When the
+// same transient errorCode (adapter_failed, provider outage, timeout, ...) hits
+// enough distinct issues inside a short window, the runtime/provider is down —
+// retrying per-issue only burns budget and multiplies recovery noise. Stop
+// queuing continuation retries for that errorCode until the window clears.
+const CONTINUATION_INFRA_BREAKER_WINDOW_MS = 15 * 60 * 1000;
+const CONTINUATION_INFRA_BREAKER_MIN_DISTINCT_ISSUES = 3;
 
 const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your usage limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
@@ -891,6 +912,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (latestFinishedAt === null) latestFinishedAt = row.finishedAt ?? null;
     }
     return { consecutive, latestFinishedAt };
+  }
+
+  async function isCompanyInfraFailureBreakerOpen(companyId: string, errorCode: string | null) {
+    if (!errorCode || !TRANSIENT_INFRA_CONTINUATION_ERROR_CODES.has(errorCode)) return false;
+    const since = new Date(Date.now() - CONTINUATION_INFRA_BREAKER_WINDOW_MS);
+    const rows = await db
+      .select({
+        issueId: sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.status, "failed"),
+          eq(heartbeatRuns.errorCode, errorCode),
+          gte(heartbeatRuns.createdAt, since),
+        ),
+      )
+      .groupBy(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId'`)
+      .limit(CONTINUATION_INFRA_BREAKER_MIN_DISTINCT_ISSUES);
+    return rows.filter((row) => readNonEmptyString(row.issueId)).length >=
+      CONTINUATION_INFRA_BREAKER_MIN_DISTINCT_ISSUES;
   }
 
   async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
@@ -3763,6 +3806,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       providerQuotaMonitored: 0,
       recentProgressExempted: 0,
       operatorCancelExempted: 0,
+      infraBreakerSkipped: 0,
       skipped: 0,
       issueIds: [] as string[],
     };
@@ -4333,6 +4377,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           } else {
             result.skipped += 1;
           }
+          continue;
+        }
+
+        if (
+          classification.kind === "transient_infra" &&
+          (await isCompanyInfraFailureBreakerOpen(issue.companyId, classification.errorCode))
+        ) {
+          logger.warn(
+            { companyId: issue.companyId, errorCode: classification.errorCode },
+            "infra failure circuit breaker open: skipping continuation retry",
+          );
+          result.infraBreakerSkipped += 1;
           continue;
         }
 

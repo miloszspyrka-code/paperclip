@@ -190,6 +190,49 @@ export interface ToolConnectionInstallSnapshot {
   installs: ToolConnectionInstall[];
 }
 
+export type ToolAgentAppAssignmentMode = "all_agents" | "specific_agents" | "none";
+
+export interface ToolAgentAppAssignmentScope {
+  forAgent: boolean;
+  mode: ToolAgentAppAssignmentMode;
+  agentIds: string[];
+}
+
+export interface ToolAgentAppInstallScope extends ToolAgentAppAssignmentScope {
+  futureAgentAutoInstall: boolean;
+}
+
+export interface ToolAgentAppBinding {
+  app: {
+    id: string;
+    name: string;
+    type: ToolApplicationType;
+    status: ToolApplicationStatus;
+  };
+  connection: {
+    id: string;
+    name: string;
+    transport: ToolConnectionTransport;
+    status: ToolConnectionStatus;
+    enabled: boolean;
+  };
+  permitted: ToolAgentAppAssignmentScope;
+  installedEveryRun: ToolAgentAppInstallScope;
+}
+
+export interface ToolAgentAppsResponse {
+  agentId: string;
+  companyId: string;
+  apps: ToolAgentAppBinding[];
+}
+
+export interface ToolAgentAppBindingsResponse {
+  companyId: string;
+  agentId: string | null;
+  appId: string | null;
+  bindings: ToolAgentAppBinding[];
+}
+
 export type ConnectionTokenScope = string | string[];
 export type ConnectionTokenSubject = { type: "app" } | { type: "user"; userId: string };
 

@@ -29,21 +29,17 @@ import {
   asStringArray,
   parseObject,
   buildPaperclipEnv,
-  joinPromptSections,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
-  renderTemplate,
-  renderPaperclipWakePrompt,
-  isPaperclipRecoveryWakePayload,
   stringifyPaperclipWakePayload,
-  DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   runChildProcess,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
+import { buildOpenCodeRunPrompt } from "./prompt.js";
 import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
@@ -55,6 +51,14 @@ import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
+const NATIVE_CTBA_AGENTS = new Set([
+  "ctb-plan",
+  "ctb-executor",
+  "ctb-engineer",
+  "ctb-designer",
+  "ctb-ui-qa",
+  "ctb-cto-infra",
+]);
 
 function firstNonEmptyLine(text: string): string {
   return (
@@ -181,10 +185,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
 
-  const promptTemplate = asString(
-    config.promptTemplate,
-    DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
-  );
   const command = asString(config.command, "opencode");
   const model = asString(config.model, "").trim();
   const variant = asString(config.variant, "").trim();
@@ -326,6 +326,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (fromExtraArgs.length > 0) return fromExtraArgs;
       return asStringArray(config.args);
     })();
+    const configAgent = asString(config.agent, "").trim();
+    if (configAgent && !NATIVE_CTBA_AGENTS.has(configAgent)) {
+      throw new Error(`Unsupported OpenCode agent selector: ${configAgent}`);
+    }
+    if (extraArgs.some((arg) => arg === "--agent" || arg.startsWith("--agent="))) {
+      throw new Error("OpenCode agent selection is server-controlled; --agent in extraArgs is not allowed");
+    }
     let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
     let localSkillsDir: string | null = null;
     let remoteRuntimeRootDir: string | null = null;
@@ -497,41 +504,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return notes;
     })();
 
-    const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
-    const templateData = {
-      agentId: agent.id,
-      companyId: agent.companyId,
-      runId,
-      company: { id: agent.companyId },
-      agent,
-      run: { id: runId, source: "on_demand" },
-      context,
-    };
-    const renderedBootstrapPrompt =
-      !sessionId && bootstrapPromptTemplate.trim().length > 0
-        ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
-        : "";
-    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(sessionId) });
-    const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
-    const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
-      ? ""
-      : renderTemplate(promptTemplate, templateData);
-    const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
-    const prompt = joinPromptSections([
+    const built = buildOpenCodeRunPrompt({
+      ctx: { agent, runId, context },
+      config,
       instructionsPrefix,
-      renderedBootstrapPrompt,
-      wakePrompt,
-      sessionHandoffNote,
-      renderedPrompt,
-    ]);
-    const promptMetrics = {
-      promptChars: prompt.length,
-      instructionsChars: instructionsPrefix.length,
-      bootstrapPromptChars: renderedBootstrapPrompt.length,
-      wakePromptChars: wakePrompt.length,
-      sessionHandoffChars: sessionHandoffNote.length,
-      heartbeatPromptChars: renderedPrompt.length,
-    };
+      sessionId,
+    });
+    const prompt = built.prompt;
+    const promptMetrics = built.promptMetrics;
 
     // Optional diagnostic: surface OpenCode's own logs on stderr (captured into the
     // run result) so failures that OpenCode otherwise wraps as an opaque
@@ -547,6 +527,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (resumeSessionId) args.push("--session", resumeSessionId);
       if (model) args.push("--model", model);
       if (variant) args.push("--variant", variant);
+      // Server-side resolved native CTB agent. Paperclip selects the ctb-* agent from the
+      // effective profile/role/issue (never from client-supplied prose); passing it here
+      // enforces the ctb-* permission block on the directly-launched OpenCode run instead of
+      // silently falling back to the default OpenCode agent.
+      if (configAgent.length > 0) args.push("--agent", configAgent);
       if (extraArgs.length > 0) args.push(...extraArgs);
       return args;
     };
@@ -563,6 +548,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           env: loggedEnv,
           prompt,
           promptMetrics,
+          // MCP/tool context-cost telemetry (server names/counts, serialized
+          // managed-config size; tool inventory stays NOT_EXPOSED — see
+          // diagnostics.tools.measurement). No secrets: server tokens are not
+          // part of the diagnostics payload.
+          runtimeDiagnostics: preparedRuntimeConfig.diagnostics,
           context,
         });
       }
@@ -667,6 +657,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stdout: sanitizeSecretText(attempt.proc.stdout),
           stderr: sanitizeSecretText(attempt.proc.stderr),
           opencodeStorageDir: preparedRuntimeConfig.paths.dataHome,
+          // "exact" when OpenCode emitted provider token events; "not_exposed"
+          // otherwise. Char metrics in promptMetrics are measured, never
+          // converted to tokens.
+          usageMeasurement: attempt.parsed.usageMeasurement,
+          promptMetrics,
         },
         summary: attempt.parsed.summary ? sanitizeSecretText(attempt.parsed.summary) : attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),

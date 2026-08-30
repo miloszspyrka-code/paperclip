@@ -133,7 +133,7 @@ async function main() {
       results[name] = response.status === 200 && !/"error"\s*:/.test(text);
     }
     const hidden = await rpc(nextId, "tools/call", {
-      name: "paperclipApprovalDecision",
+      name: "paperclipCreateApproval",
       arguments: {},
     });
     const boardOnly = await rpc(nextId + 1, "tools/call", {

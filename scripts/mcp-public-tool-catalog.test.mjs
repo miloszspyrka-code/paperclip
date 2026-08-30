@@ -9,12 +9,10 @@ import {
 const removedNames = [
   "paperclipInboxLite",
   "paperclipGetComment",
-  "paperclipListIssueApprovals",
   "paperclipListDocumentRevisions",
   "paperclipGetGoal",
   "paperclipListApprovals",
   "paperclipCreateApproval",
-  "paperclipGetApproval",
   "paperclipGetApprovalIssues",
   "paperclipListApprovalComments",
   "paperclipCheckoutIssue",
@@ -27,8 +25,23 @@ const removedNames = [
   "paperclipRestoreIssueDocumentRevision",
   "paperclipLinkIssueApproval",
   "paperclipUnlinkIssueApproval",
-  "paperclipApprovalDecision",
   "paperclipAddApprovalComment",
+];
+
+const boardOperatorTools = [
+  "paperclipListSecrets",
+  "paperclipCreateSecret",
+  "paperclipUpdateSecret",
+  "paperclipRotateSecret",
+  "paperclipDeleteSecret",
+  "paperclipCreateToolApplication",
+  "paperclipCreateToolConnection",
+  "paperclipSetAgentAppPermission",
+  "paperclipSetAgentAppInstallPolicy",
+  "paperclipCreateToolGateway",
+  "paperclipPrepareIssueDelivery",
+  "paperclipCreateIssuePullRequest",
+  "paperclipMergeIssuePullRequest",
 ];
 
 const allTools = [
@@ -46,11 +59,20 @@ test("public catalog exposes the allowlisted tools in stable order without a mag
   assert.ok(catalog.length > 0);
   assert.ok(removedNames.every((name) => !catalog.some((tool) => tool.name === name)));
   assert.ok(!catalog.some((tool) => tool.name === "paperclipApiRequest"));
+  assert.ok(boardOperatorTools.every((name) => catalog.some((tool) => tool.name === name)));
   for (const required of ["paperclipUpdateDocument", "paperclipWikiProposeChange", "paperclipWikiApplyChange"]) {
     assert.ok(catalog.some((tool) => tool.name === required));
   }
   for (const compat of ["paperclipListSkills", "paperclipGetSkill", "paperclipUseSkill"]) {
     assert.ok(catalog.some((tool) => tool.name === compat));
+  }
+  for (const governed of [
+    "paperclipListIssueInteractions",
+    "paperclipResolveIssueInteraction",
+    "paperclipApprovalDecision",
+    "paperclipCancelHeartbeatRun",
+  ]) {
+    assert.ok(catalog.some((tool) => tool.name === governed));
   }
 });
 
@@ -85,7 +107,11 @@ test("similar tool descriptions have distinct primary intent", () => {
   assert.match(descriptions.paperclipWaitForIssueWorkspaceService, /^Wait /);
   assert.match(descriptions.paperclipCreateIssue, /^Create /);
   assert.match(descriptions.paperclipUpdateIssue, /^Update /);
+  assert.match(descriptions.paperclipUpdateAgent, /agents:configure or agents:suggest-changes/);
   assert.match(descriptions.paperclipAddComment, /^Add /);
+  assert.match(descriptions.paperclipListIssueInteractions, /^List /);
+  assert.match(descriptions.paperclipResolveIssueInteraction, /^Accept, reject/);
+  assert.match(descriptions.paperclipCancelHeartbeatRun, /^Cancel /);
   assert.match(descriptions.paperclipWikiProposeChange, /^Prepare a non-mutating/);
   assert.match(descriptions.paperclipWikiApplyChange, /^Apply a previously prepared/);
 });

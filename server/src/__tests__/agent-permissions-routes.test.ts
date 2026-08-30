@@ -44,6 +44,8 @@ const mockAgentService = vi.hoisted(() => ({
   list: vi.fn(),
   create: vi.fn(),
   activatePendingApproval: vi.fn(),
+  pause: vi.fn(),
+  resume: vi.fn(),
   terminate: vi.fn(),
   update: vi.fn(),
   updatePermissions: vi.fn(),
@@ -81,8 +83,11 @@ const mockHeartbeatService = vi.hoisted(() => ({
   listTaskSessions: vi.fn(),
   resetRuntimeSession: vi.fn(),
   getRun: vi.fn(),
+  getRunRuntimeState: vi.fn(),
+  reconcileRun: vi.fn(),
   cancelRun: vi.fn(),
   cancelInvocationsForAgents: vi.fn(),
+  cancelActiveForAgent: vi.fn(),
 }));
 
 const mockIssueApprovalService = vi.hoisted(() => ({
@@ -331,6 +336,8 @@ describe.sequential("agent permission routes", () => {
     mockHeartbeatService.listTaskSessions.mockReset();
     mockHeartbeatService.resetRuntimeSession.mockReset();
     mockHeartbeatService.getRun.mockReset();
+    mockHeartbeatService.getRunRuntimeState.mockReset();
+    mockHeartbeatService.reconcileRun.mockReset();
     mockHeartbeatService.cancelRun.mockReset();
     mockHeartbeatService.cancelInvocationsForAgents.mockReset();
     mockIssueApprovalService.linkManyForApproval.mockReset();
@@ -1879,5 +1886,132 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(404);
     expect(res.body.error).toBe("Heartbeat run not found");
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  it("exposes runtime state only within the caller company scope", async () => {
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-1",
+      companyId,
+      agentId,
+      status: "running",
+    });
+    mockHeartbeatService.getRunRuntimeState.mockResolvedValue({
+      runId: "run-1",
+      paperclipStatus: "running",
+      recommendedDisposition: "no_action",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "caller-run",
+      source: "agent_key",
+    });
+
+    const res = await request(app).get("/api/heartbeat-runs/run-1/runtime-state");
+
+    expect(res.status).toBe(200);
+    expect(res.body.recommendedDisposition).toBe("no_action");
+    expect(mockHeartbeatService.getRunRuntimeState).toHaveBeenCalledWith("run-1");
+  });
+
+  it("requires a run-bound agent and limits reconciliation to that agent's runs", async () => {
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-1",
+      companyId,
+      agentId,
+      status: "running",
+    });
+    mockHeartbeatService.reconcileRun.mockResolvedValue({ outcome: "NO_ACTION", state: null });
+    const noRunApp = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+    });
+    const missingRun = await request(noRunApp).post("/api/heartbeat-runs/run-1/reconcile").send({});
+    expect(missingRun.status).toBe(401);
+    expect(missingRun.body.error).toBe("Agent run id required");
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "caller-run",
+      source: "agent_key",
+    });
+    const res = await request(app).post("/api/heartbeat-runs/run-1/reconcile").send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body.outcome).toBe("NO_ACTION");
+    expect(mockHeartbeatService.reconcileRun).toHaveBeenCalledWith("run-1");
+
+    mockHeartbeatService.getRun.mockResolvedValueOnce({
+      id: "other-run",
+      companyId,
+      agentId: "other-agent",
+      status: "running",
+    });
+    const foreignAgentRun = await request(app).post("/api/heartbeat-runs/other-run/reconcile").send({});
+    expect(foreignAgentRun.status).toBe(403);
+    expect(mockHeartbeatService.reconcileRun).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("agent lifecycle pause/resume access", () => {
+  it("allows a board company member without agents:create to pause an agent", async () => {
+    // Pause/resume is agent lifecycle control available to any board operator
+    // with company access; it must not require the agents:create provisioning
+    // grant (owner/admin only). Regression guard for the 403 "no access" bug.
+    mockAgentService.getById.mockResolvedValue(baseAgent);
+    mockAgentService.pause.mockResolvedValue({
+      ...baseAgent,
+      status: "paused",
+      pauseReason: "manual",
+      pausedAt: new Date(),
+    });
+    mockAccessService.canUser.mockResolvedValue(false);
+    mockAccessService.hasPermission.mockResolvedValue(false);
+    mockAccessService.decide.mockResolvedValue({
+      allowed: false,
+      reason: "deny_no_grant",
+      explanation: "Missing permission: agents:create.",
+    });
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const res = await request(app).post(`/api/agents/${agentId}/pause`).send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.pause).toHaveBeenCalledWith(agentId);
+  });
+
+  it("allows a board company member without agents:create to resume a paused agent", async () => {
+    mockAgentService.getById.mockResolvedValue({ ...baseAgent, status: "paused" });
+    mockAgentService.resume.mockResolvedValue({ ...baseAgent, status: "idle" });
+    mockAccessService.canUser.mockResolvedValue(false);
+    mockAccessService.hasPermission.mockResolvedValue(false);
+    mockAccessService.decide.mockResolvedValue({
+      allowed: false,
+      reason: "deny_no_grant",
+      explanation: "Missing permission: agents:create.",
+    });
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const res = await request(app).post(`/api/agents/${agentId}/resume`).send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.resume).toHaveBeenCalledWith(agentId);
   });
 });

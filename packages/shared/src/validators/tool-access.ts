@@ -203,6 +203,20 @@ export const putToolConnectionInstallsSchema = z.object({
 
 export type PutToolConnectionInstalls = z.infer<typeof putToolConnectionInstallsSchema>;
 
+export const setToolConnectionAgentPermissionSchema = z.object({
+  mode: z.enum(["none", "specific_agents", "all_agents"]),
+  agentIds: z.array(z.string().uuid()).max(1000).default([]),
+}).strict().superRefine((value, ctx) => {
+  if (value.mode === "specific_agents" && value.agentIds.length === 0) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["agentIds"], message: "specific_agents requires at least one agentId" });
+  }
+  if (value.mode !== "specific_agents" && value.agentIds.length > 0) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["agentIds"], message: "agentIds are only valid with specific_agents" });
+  }
+});
+
+export type SetToolConnectionAgentPermission = z.infer<typeof setToolConnectionAgentPermissionSchema>;
+
 export const connectionTokenIssuancePathSchema = z.enum(CONNECTION_TOKEN_ISSUANCE_PATHS);
 
 export const connectionTokenScopeSchema = z.union([

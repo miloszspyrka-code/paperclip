@@ -33,6 +33,9 @@ export type OpenCodeRuntimeDiagnostics = {
     managedConnectionCount: number;
     inheritedUserMcpCount: number;
     serverNames: OpenCodeRuntimeMcpServer[];
+    // Exact size of the serialized managed-connection MCP block written into
+    // opencode.json (measured; excludes builtin tool schemas).
+    managedConnectionConfigChars: number;
   };
   tools: {
     registeredToolCount: number | NotExposedMarker;
@@ -41,6 +44,10 @@ export type OpenCodeRuntimeDiagnostics = {
       | NotExposedMarker;
     duplicateToolNames: string[] | NotExposedMarker;
     serializedToolSchemaChars: number | NotExposedMarker;
+    // How the numbers above were obtained. OpenCode does not expose a
+    // registered-tool inventory before a run, so adapter-level tool metrics
+    // stay "not_exposed" instead of being estimated.
+    measurement: "exact" | "estimated" | "not_exposed";
   };
   plugins: {
     allowlistedPluginCount: number;
@@ -278,12 +285,14 @@ function emptyDiagnostics(notes: string[]): OpenCodeRuntimeDiagnostics {
       managedConnectionCount: 0,
       inheritedUserMcpCount: 0,
       serverNames: [],
+      managedConnectionConfigChars: 0,
     },
     tools: {
       registeredToolCount: NOT_EXPOSED,
       toolsBySource: NOT_EXPOSED,
       duplicateToolNames: NOT_EXPOSED,
       serializedToolSchemaChars: NOT_EXPOSED,
+      measurement: "not_exposed",
     },
     plugins: { allowlistedPluginCount: 0, inheritedPluginCount: 0 },
     notes,
@@ -404,6 +413,9 @@ export async function prepareOpenCodeRuntimeConfig(
     name,
     source: "managed_connection",
   }));
+  if (Object.keys(mcpServers).length > 0) {
+    diagnostics.mcp.managedConnectionConfigChars = JSON.stringify(mcpServers).length;
+  }
   const plugins = parsePluginAllowlist(input.config, runtimeRoot, notes);
   diagnostics.plugins.allowlistedPluginCount = plugins.length;
   diagnostics.plugins.inheritedPluginCount = 0;
@@ -423,6 +435,31 @@ export async function prepareOpenCodeRuntimeConfig(
   if (Object.keys(mcpServers).length > 0) nextConfig.mcp = mcpServers;
   if (plugins.length > 0) nextConfig.plugin = plugins.map((plugin) => localPluginEntries.get(plugin) ?? plugin);
   if (Object.keys(operatorCommands).length > 0) nextConfig.command = operatorCommands;
+  // Native CTB agents: OpenCode owns native agents (model/context/permissions/runtime).
+  // They are injected EXPLICITLY from a deployment-configured source, not inherited from the
+  // host project config (which stays disabled via OPENCODE_DISABLE_PROJECT_CONFIG). This keeps
+  // the ctb-* agent permission blocks enforced on the Paperclip-launched OpenCode run path,
+  // not only on the shared 4096 gateway backend. Without this, opencode run would use the
+  // default OpenCode agent and silently bypass ctb-* enforcement (silent downgrade).
+  const nativeAgentsConfigPath = (
+    input.env.PAPERCLIP_OPENCODE_NATIVE_AGENTS_CONFIG ?? process.env.PAPERCLIP_OPENCODE_NATIVE_AGENTS_CONFIG
+  )?.trim();
+  if (nativeAgentsConfigPath) {
+    try {
+      const parsed = JSON.parse(await fs.readFile(nativeAgentsConfigPath, "utf8")) as Record<string, unknown>;
+      const sourceAgents = isPlainObject(parsed.agent) ? (parsed.agent as Record<string, unknown>) : {};
+      const nativeAgents: Record<string, unknown> = {};
+      for (const [name, def] of Object.entries(sourceAgents)) {
+        if (name.startsWith("ctb-") && isPlainObject(def)) nativeAgents[name] = def;
+      }
+      if (Object.keys(nativeAgents).length > 0) {
+        nextConfig.agent = nativeAgents;
+        notes.push(`Injected ${Object.keys(nativeAgents).length} native CTB agent definition(s) from ${nativeAgentsConfigPath}.`);
+      }
+    } catch (err) {
+      notes.push(`PAPERCLIP_OPENCODE_NATIVE_AGENTS_CONFIG set but unreadable: ${(err as Error)?.message ?? String(err)}`);
+    }
+  }
   await fs.writeFile(
     path.join(configHome, "opencode", "opencode.json"),
     `${JSON.stringify(nextConfig, null, 2)}\n`,
@@ -436,8 +473,13 @@ export async function prepareOpenCodeRuntimeConfig(
     destinationFile: authFile,
     notes,
   });
-  notes.push("Built Paperclip OpenCode config from scratch; host MCP, plugins, commands, agents and skills were not read.");
+  notes.push("Built Paperclip OpenCode config from scratch; host MCP, plugins, commands and skills were not read. Native CTB agents are injected only when PAPERCLIP_OPENCODE_NATIVE_AGENTS_CONFIG points at an explicit source (never the host project config).");
   notes.push("Injected only effective Paperclip Connection MCP gateways.");
+  if (diagnostics.mcp.managedConnectionCount > 0) {
+    notes.push(
+      `Tool inventory is not exposed by OpenCode before a run; registeredToolCount/toolsBySource/serializedToolSchemaChars remain ${NOT_EXPOSED}. Measure per-run token usage via resultJson.usageMeasurement.`,
+    );
+  }
   if (Object.keys(operatorCommands).length > 0) {
     notes.push(`Injected ${Object.keys(operatorCommands).length} Paperclip operator command wrappers.`);
   } else {

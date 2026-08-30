@@ -29,6 +29,10 @@ export function parseOpenCodeJsonl(stdout: string) {
     cachedInputTokens: 0,
     outputTokens: 0,
   };
+  // "exact" only when OpenCode emitted at least one step_finish token event
+  // (provider-reported numbers). Without it the zeroed counters are
+  // indistinguishable from "the backend never reported usage".
+  let sawTokenEvent = false;
   let costUsd = 0;
 
   for (const rawLine of stdout.split(/\r?\n/)) {
@@ -58,6 +62,7 @@ export function parseOpenCodeJsonl(stdout: string) {
       usage.cachedInputTokens += asNumber(cache.read, 0);
       usage.outputTokens += asNumber(tokens.output, 0) + asNumber(tokens.reasoning, 0);
       costUsd += asNumber(part.cost, 0);
+      sawTokenEvent = true;
       continue;
     }
 
@@ -82,6 +87,10 @@ export function parseOpenCodeJsonl(stdout: string) {
     sessionId,
     summary: messages.join("\n\n").trim(),
     usage,
+    // "exact": provider-reported via step_finish token events.
+    // "not_exposed": no token events in the stream; zeroed counters must not be
+    // read as measured zeros.
+    usageMeasurement: sawTokenEvent ? ("exact" as const) : ("not_exposed" as const),
     costUsd,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
     toolErrors,

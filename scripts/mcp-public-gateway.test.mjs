@@ -48,7 +48,13 @@ async function startGateway({ storage, upstreamPort, refreshTtlMs = "10000", pri
       MCP_PUBLIC_KEY_FILE: join(storage, "signing.key"),
       MCP_PUBLIC_REFRESH_TOKENS_FILE: join(storage, "refresh-tokens.json"),
       MCP_PUBLIC_AUDIT_FILE: join(storage, "audit.jsonl"),
-      MCP_PUBLIC_PRINCIPALS: JSON.stringify(principals),
+      MCP_PUBLIC_PRINCIPALS: JSON.stringify(Object.fromEntries(Object.entries(principals).map(([login, principal]) => [
+        login,
+        {
+          ...principal,
+          upstreamTokens: principal.upstreamTokens || { paperclip: "test-board-api-key" },
+        },
+      ]))),
       MCP_PUBLIC_REFRESH_TTL_MS: refreshTtlMs,
       MCP_PUBLIC_TARGETS: JSON.stringify({ paperclip: { url: `http://127.0.0.1:${upstreamPort}/mcp` } }),
     },
@@ -59,6 +65,62 @@ async function startGateway({ storage, upstreamPort, refreshTtlMs = "10000", pri
   await waitFor(base, child);
   return { base, process: child };
 }
+
+test("public gateway forwards only the OAuth principal's configured Board credential", async (t) => {
+  const storage = mkdtempSync(join(root, ".tmp-mcp-public-gateway-"));
+  const receivedAuthorizations = [];
+  const upstream = http.createServer(async (req, res) => {
+    receivedAuthorizations.push(req.headers.authorization || null);
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const message = JSON.parse(body || "{}");
+    const result = message.method === "tools/list" ? { tools: [] } : { protocolVersion: "2025-03-26", capabilities: {} };
+    res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "upstream-session" });
+    res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+  });
+  const upstreamPort = await listen(upstream);
+  const gateway = await startGateway({
+    storage,
+    upstreamPort,
+    principals: {
+      "gateway-test-user": {
+        sub: "board-user",
+        companyIds: ["11111111-1111-1111-1111-111111111111"],
+        upstreamTokens: { paperclip: "board-principal-api-key" },
+      },
+    },
+  });
+  t.after(async () => {
+    await stopGateway(gateway.process);
+    await close(upstream);
+    rmSync(storage, { recursive: true, force: true });
+  });
+
+  const { token } = await authenticate(gateway.base);
+  const initialized = await rpc(gateway.base, token.access_token, 1, "initialize", { protocolVersion: "2025-03-26", capabilities: {} });
+  const listed = await rpc(gateway.base, token.access_token, 2, "tools/list", {}, initialized.session);
+
+  assert.equal(listed.status, 200);
+  assert.ok(receivedAuthorizations.every((value) => value === "Bearer board-principal-api-key"));
+});
+
+test("public gateway refuses OAuth principals without an upstream Board credential", async (t) => {
+  const storage = mkdtempSync(join(root, ".tmp-mcp-public-gateway-"));
+  const upstream = http.createServer((req, res) => res.end());
+  const upstreamPort = await listen(upstream);
+  const gateway = await startGateway({ storage, upstreamPort });
+  t.after(async () => {
+    await stopGateway(gateway.process);
+    await close(upstream);
+    rmSync(storage, { recursive: true, force: true });
+  });
+
+  const { token } = await authenticate(gateway.base);
+  const initialized = await rpc(gateway.base, token.access_token, 1, "initialize", { protocolVersion: "2025-03-26", capabilities: {} });
+
+  assert.equal(initialized.status, 403);
+  assert.equal(initialized.json.error.message, "UPSTREAM_PRINCIPAL_UNCONFIGURED");
+});
 
 async function stopGateway(child) {
   if (child.exitCode !== null) return;
@@ -367,6 +429,9 @@ test("public document and Wiki surface enforces scopes, grants, proposals, and r
   const deniedWrite = await rpc(gateway.base, readAuth.token.access_token, 6, "tools/call", { name: "paperclipWikiProposeChange", arguments: { page: "wiki/sprawnosci-api.md", expectedHash: pageHash(), content: page } }, session);
   assert.equal(deniedWrite.status, 403);
   assert.equal(deniedWrite.json.error.data.code, "INSUFFICIENT_SCOPE");
+  const deniedBoardWrite = await rpc(gateway.base, readAuth.token.access_token, 61, "tools/call", { name: "paperclipCancelHeartbeatRun", arguments: { runId: "33333333-3333-3333-3333-333333333333" } }, session);
+  assert.equal(deniedBoardWrite.status, 403);
+  assert.equal(deniedBoardWrite.json.error.data.requiredScope, "mcp:write");
   const forbidden = await rpc(gateway.base, readAuth.token.access_token, 7, "tools/call", { name: "paperclipWikiGetPage", arguments: { page: "%2e%2e/raw/secret.md" } }, session);
   assert.equal(forbidden.json.error.data.code, "WIKI_PATH_FORBIDDEN");
   const wrongCompany = await rpc(gateway.base, readAuth.token.access_token, 8, "tools/call", { name: "paperclipWikiGetPage", arguments: { companyId: "22222222-2222-2222-2222-222222222222", page: "wiki/sprawnosci-api.md" } }, session);
@@ -378,7 +443,7 @@ test("public document and Wiki surface enforces scopes, grants, proposals, and r
   const documentWriteDenied = await rpc(gateway.base, readAuth.token.access_token, 83, "tools/call", { name: "paperclipUpdateDocument", arguments: { issueId: "issue-1", key: "plan", baseRevisionId: "rev-1", content: "No permission." } }, session);
   assert.equal(documentWriteDenied.status, 403);
 
-  const writeAuth = await authenticate(gateway.base, "mcp:read paperclip:wiki:read paperclip:wiki:write");
+  const writeAuth = await authenticate(gateway.base, "mcp:read mcp:write paperclip:wiki:read paperclip:wiki:write");
   const writeInit = await rpc(gateway.base, writeAuth.token.access_token, 9, "initialize", { protocolVersion: "2025-03-26", capabilities: {} });
   const writeSession = writeInit.session;
   const oldHash = pageHash();

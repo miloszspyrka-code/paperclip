@@ -58,6 +58,7 @@ import type {
   McpConnectionCredentialRef,
   McpJsonImportPreview,
   ToolApplication,
+  ToolAgentAppBinding,
   ToolCatalogEntry,
   ToolCatalogRefreshResult,
   ToolConnection,
@@ -2514,7 +2515,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     if (input.catalogEntryId) await assertCatalogEntry(companyId, input.catalogEntryId);
   }
 
-  async function getConnectionRow(idOrUid: string, companyId?: string) {
+  async function findConnectionRow(idOrUid: string, companyId?: string) {
     const identifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(idOrUid)
       ? eq(toolConnections.id, idOrUid)
       : eq(toolConnections.uid, idOrUid);
@@ -2522,6 +2523,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       ? and(identifier, eq(toolConnections.companyId, companyId))
       : identifier;
     const [row] = await db.select().from(toolConnections).where(where);
+    return row;
+  }
+
+  async function getConnectionRow(idOrUid: string, companyId?: string) {
+    const row = await findConnectionRow(idOrUid, companyId);
     if (!row) throw notFound("Tool connection not found");
     return row;
   }
@@ -6313,6 +6319,181 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       return connections;
     },
 
+    listAgentAppBindings: async (
+      companyId: string,
+      agentId?: string,
+      applicationId?: string,
+    ): Promise<ToolAgentAppBinding[]> => {
+      await assertOptionalAgent(companyId, agentId, "Tool app assignment agent");
+      const [applications, connectionRows] = await Promise.all([
+        db.select({
+          id: toolApplications.id,
+          name: toolApplications.name,
+          type: toolApplications.type,
+          status: toolApplications.status,
+        }).from(toolApplications).where(eq(toolApplications.companyId, companyId)),
+        db.select({
+          id: toolConnections.id,
+          applicationId: toolConnections.applicationId,
+          name: toolConnections.name,
+          transport: toolConnections.transport,
+          status: toolConnections.status,
+          enabled: toolConnections.enabled,
+          updatedAt: toolConnections.updatedAt,
+        }).from(toolConnections).where(eq(toolConnections.companyId, companyId)).orderBy(desc(toolConnections.updatedAt)),
+      ]);
+      const applicationById = new Map(applications.map((application) => [application.id, application]));
+      const connections = connectionRows.filter((connection) =>
+        (!applicationId || connection.applicationId === applicationId) && applicationById.has(connection.applicationId),
+      );
+      if (connections.length === 0) return [];
+
+      const connectionIds = connections.map((connection) => connection.id);
+      const profiles = await db
+        .select({ id: toolProfiles.id, profileKey: toolProfiles.profileKey, status: toolProfiles.status })
+        .from(toolProfiles)
+        .where(eq(toolProfiles.companyId, companyId));
+      const appProfiles = profiles.filter((profile) => {
+        if (!profile.profileKey.startsWith("app:")) return false;
+        const connectionId = profile.profileKey.slice("app:".length);
+        return connectionIds.includes(connectionId) && profile.status === "active";
+      });
+      const profileIds = appProfiles.map((profile) => profile.id);
+      const [profileBindingRows, installRows] = await Promise.all([
+        profileIds.length === 0
+          ? Promise.resolve([] as Array<typeof toolProfileBindings.$inferSelect>)
+          : db.select().from(toolProfileBindings).where(and(
+            eq(toolProfileBindings.companyId, companyId),
+            inArray(toolProfileBindings.profileId, profileIds),
+          )),
+        db.select().from(toolConnectionInstalls).where(and(
+          eq(toolConnectionInstalls.companyId, companyId),
+          inArray(toolConnectionInstalls.connectionId, connectionIds),
+        )),
+      ]);
+      const profileIdByConnectionId = new Map(
+        appProfiles.map((profile) => [profile.profileKey.slice("app:".length), profile.id]),
+      );
+
+      const assignmentScope = (rows: Array<{ targetType: string; targetId: string }>) => {
+        const hasCompanyTarget = rows.some((row) => row.targetType === "company" && row.targetId === companyId);
+        const agentIds = [...new Set(rows
+          .filter((row) => row.targetType === "agent")
+          .map((row) => row.targetId))].sort();
+        return {
+          forAgent: Boolean(agentId && (hasCompanyTarget || agentIds.includes(agentId))),
+          mode: hasCompanyTarget ? "all_agents" as const : agentIds.length > 0 ? "specific_agents" as const : "none" as const,
+          agentIds,
+        };
+      };
+
+      return connections.map((connection) => {
+        const application = applicationById.get(connection.applicationId)!;
+        const profileId = profileIdByConnectionId.get(connection.id);
+        const permitted = assignmentScope(profileId
+          ? profileBindingRows.filter((binding) => binding.profileId === profileId)
+          : []);
+        const installs = installRows.filter((install) => install.connectionId === connection.id);
+        const installedEveryRun = assignmentScope(installs);
+        return {
+          app: {
+            id: application.id,
+            name: application.name,
+            type: application.type,
+            status: application.status,
+          },
+          connection: {
+            id: connection.id,
+            name: connection.name,
+            transport: connection.transport,
+            status: connection.status,
+            enabled: connection.enabled,
+          },
+          permitted,
+          installedEveryRun: {
+            ...installedEveryRun,
+            futureAgentAutoInstall: installs.some((install) => install.targetType === "company" && install.targetId === companyId),
+          },
+        };
+      });
+    },
+
+    setConnectionAgentPermission: async (
+      connectionId: string,
+      input: { mode: "none" | "specific_agents" | "all_agents"; agentIds: string[] },
+      actor?: ActorInfo,
+    ) => {
+      const connection = await getConnectionRow(connectionId);
+      for (const agentId of input.agentIds) {
+        await assertTargetExists(connection.companyId, "agent", agentId);
+      }
+      const readPermission = async () => {
+        const [profile] = await db
+          .select({ id: toolProfiles.id })
+          .from(toolProfiles)
+          .where(and(
+            eq(toolProfiles.companyId, connection.companyId),
+            eq(toolProfiles.profileKey, `app:${connection.id}`),
+          ));
+        if (!profile) return { mode: "none" as const, agentIds: [], forAgent: false };
+        const bindings = await db
+          .select({ targetType: toolProfileBindings.targetType, targetId: toolProfileBindings.targetId })
+          .from(toolProfileBindings)
+          .where(and(
+            eq(toolProfileBindings.companyId, connection.companyId),
+            eq(toolProfileBindings.profileId, profile.id),
+          ));
+        const hasCompanyTarget = bindings.some(
+          (binding) => binding.targetType === "company" && binding.targetId === connection.companyId,
+        );
+        const agentIds = [...new Set(bindings
+          .filter((binding) => binding.targetType === "agent")
+          .map((binding) => binding.targetId))].sort();
+        return {
+          mode: hasCompanyTarget ? "all_agents" as const : agentIds.length > 0 ? "specific_agents" as const : "none" as const,
+          agentIds,
+          forAgent: false,
+        };
+      };
+      const before = await readPermission();
+
+      const profile = await db.transaction(async (tx) => {
+        const profile = await appProfileForConnection(tx, connection);
+        await tx.delete(toolProfileBindings).where(and(
+          eq(toolProfileBindings.companyId, connection.companyId),
+          eq(toolProfileBindings.profileId, profile.id),
+          inArray(toolProfileBindings.targetType, ["company", "agent"]),
+        ));
+        const bindings = input.mode === "all_agents"
+          ? [{ targetType: "company" as const, targetId: connection.companyId }]
+          : input.mode === "specific_agents"
+            ? [...new Set(input.agentIds)].map((targetId) => ({ targetType: "agent" as const, targetId }))
+            : [];
+        if (bindings.length > 0) {
+          await tx.insert(toolProfileBindings).values(bindings.map((binding) => ({
+            companyId: connection.companyId,
+            profileId: profile.id,
+            targetType: binding.targetType,
+            targetId: binding.targetId,
+            priority: 100,
+            metadata: { source: "operator_agent_permission" },
+          })));
+        }
+        return profile;
+      });
+
+      await audit({
+        companyId: connection.companyId,
+        connectionId: connection.id,
+        action: "tool_connection.agent_permission_set",
+        outcome: "success",
+        actor,
+        details: { mode: input.mode, agentCount: input.agentIds.length, profileId: profile.id },
+      });
+      const after = await readPermission();
+      return { connection: toConnection(connection), profileId: profile.id, before, after };
+    },
+
     createConnection: async (companyId: string, input: CreateToolConnection): Promise<ToolConnection> => {
       let applicationId = input.applicationId;
       let applicationNamespace = input.applicationName ?? input.name;
@@ -6367,6 +6548,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
     getConnection: async (connectionId: string, companyId?: string): Promise<ToolConnection> => {
       const connection = toConnection(await getConnectionRow(connectionId, companyId));
+      connection.installs = await listConnectionInstalls(connection.id, connection.companyId);
+      return connection;
+    },
+
+    findConnection: async (connectionId: string, companyId?: string): Promise<ToolConnection | null> => {
+      const row = await findConnectionRow(connectionId, companyId);
+      if (!row) return null;
+      const connection = toConnection(row);
       connection.installs = await listConnectionInstalls(connection.id, connection.companyId);
       return connection;
     },
@@ -6492,7 +6681,6 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           await assertOptionalAgent(connection.companyId, install.targetId, "Tool connection install agent");
         }
       }
-      const accessExtensions: Array<{ targetType: "company" | "agent"; targetId: string; profileId: string }> = [];
       await db.transaction(async (tx) => {
         const existing = await tx
           .select()
@@ -6517,38 +6705,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             createdByUserId: actor?.actorType === "user" ? actor.actorId ?? null : null,
           })));
         }
-        if (requested.size > 0) {
-          const profile = await appProfileForConnection(tx, connection);
-          for (const install of requested.values()) {
-            const [binding] = await tx
-              .insert(toolProfileBindings)
-              .values({
-                companyId: connection.companyId,
-                profileId: profile.id,
-                targetType: install.targetType,
-                targetId: install.targetId,
-                priority: 100,
-                metadata: { source: "tool_connection_install", connectionId: connection.id },
-                createdByAgentId: actor?.actorType === "agent" ? actor.actorId ?? null : null,
-                createdByUserId: actor?.actorType === "user" ? actor.actorId ?? null : null,
-              })
-              .onConflictDoNothing()
-              .returning({ id: toolProfileBindings.id });
-            if (binding) accessExtensions.push({ targetType: install.targetType, targetId: install.targetId, profileId: profile.id });
-          }
-        }
       });
-      for (const extension of accessExtensions) {
-        await logActivity(db, {
-          companyId: connection.companyId,
-          actorType: actor?.actorType ?? "system",
-          actorId: actor?.actorId ?? "system",
-          action: "tool_connection.install_access_extended",
-          entityType: "tool_connection",
-          entityId: connection.id,
-          details: extension,
-        });
-      }
       return { connectionId: connection.id, installs: await listConnectionInstalls(connection.id, connection.companyId) };
     },
 
@@ -6579,14 +6736,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       return toConnection(row);
     },
 
-    archiveConnection: async (connectionId: string): Promise<ToolConnection> => {
+    archiveConnection: async (connectionId: string): Promise<ToolConnection | null> => {
       const row = await db.transaction(async (tx) => {
         const [updatedConnection] = await tx
           .update(toolConnections)
           .set({ status: "archived", enabled: false, updatedAt: new Date() })
           .where(eq(toolConnections.id, connectionId))
           .returning();
-        if (!updatedConnection) throw notFound("Tool connection not found");
+        if (!updatedConnection) return null;
 
         const remainingConnections = await tx
           .select({ id: toolConnections.id })
@@ -6609,7 +6766,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
         return updatedConnection;
       });
-      return toConnection(row);
+      return row ? toConnection(row) : null;
     },
 
     checkHealth: checkConnectionHealth,
