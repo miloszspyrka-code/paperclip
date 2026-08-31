@@ -2,6 +2,8 @@
 // Minimal adapter-facing interfaces (no drizzle dependency)
 // ---------------------------------------------------------------------------
 
+import type { CompactionDecision, FirstModelTokenTelemetry, ToolSchemaTelemetry } from "@paperclipai/shared";
+import type { RuntimePromptSectionSelection } from "./context-economy-wiring.js";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import type { AdapterExecutionTarget } from "./execution-target.js";
 import type { RuntimeStatusSink } from "./runtime-progress.js";
@@ -166,6 +168,30 @@ export interface AdapterExecutionResult {
   } | null;
   /** Present only for a persisted native-mode run; legacy adapters omit it. */
   nativeFinalization?: NativeFinalizationResult;
+  /**
+   * Paperclip context-economy diagnostics for this run: narrowed managed-MCP
+   * set, derived tool-schema telemetry, first-model token telemetry, the
+   * Paperclip-controlled prompt-section selection, and the context-budget /
+   * compaction decision. Absent on runs where the control plane did not request
+   * economy instrumentation.
+   */
+  runContextDiagnostics?: RunContextDiagnostics | null;
+}
+
+/**
+ * Structured context-economy diagnostics surfaced on the execution result so the
+ * Paperclip control plane can persist them per run without re-deriving from the
+ * agent runtime.
+ */
+export interface RunContextDiagnostics {
+  mcpNarrowing?: {
+    droppedUnauthorized: string[];
+    droppedInactive: string[];
+  } | null;
+  tools?: ToolSchemaTelemetry | null;
+  firstModelTokens?: FirstModelTokenTelemetry | null;
+  promptSections?: RuntimePromptSectionSelection | null;
+  compaction?: CompactionDecision | null;
 }
 
 export interface AdapterSessionCodec {
