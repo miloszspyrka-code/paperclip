@@ -83,6 +83,74 @@ function resolveOpenCodeBiller(env: Record<string, string>, provider: string | n
   return inferOpenAiCompatibleBiller(env, null) ?? provider ?? "unknown";
 }
 
+const PUBLICATION_ACTIONS = new Set<string>([
+  "push",
+  "create_remote_branch",
+  "create_pr",
+  "update_pr",
+  "merge",
+  "rebase_upstream",
+  "auto_merge",
+]);
+
+type LocalPublicationCapability = {
+  action: string;
+  repo?: string;
+  ref?: string;
+};
+
+/**
+ * Parse an explicit publication capability from the adapter config. Returns
+ * null when absent or malformed, which the runtime treats as a default-deny
+ * publication policy. Only an explicit, well-formed capability authorizes a
+ * specific publication action (and, if set, repo/ref).
+ */
+export function parsePublicationCapabilityFromConfig(
+  config: Record<string, unknown>,
+): LocalPublicationCapability | null {
+  const raw = parseObject(config.publicationCapability);
+  const action = asString(raw.action, "");
+  if (!PUBLICATION_ACTIONS.has(action)) return null;
+  const repo = asString(raw.repo, "");
+  const ref = asString(raw.ref, "");
+  return {
+    action,
+    ...(repo.length > 0 ? { repo } : {}),
+    ...(ref.length > 0 ? { ref } : {}),
+  };
+}
+
+/**
+ * Build the deterministic publication policy directive injected into the agent
+ * prompt (invariant 3 - generic publication capability gate). Mirrors the
+ * canonical `buildPublicationPolicyDirective` contract in `@paperclipai/shared`
+ * so the runtime prompt and the server-side authorization decision cannot
+ * drift. Default-deny when no capability is present; otherwise authorizes only
+ * the specific action/repo/ref.
+ */
+export function buildPublicationPolicyDirective(
+  capability: LocalPublicationCapability | null,
+): string {
+  const HEADER = "[paperclip] Publication policy";
+  if (!capability) {
+    return (
+      `${HEADER} (default-deny): you are NOT authorized to publish this work. ` +
+      `Local scoped edits and tests are not authorization to publish. ` +
+      `Do not run \`git push\`, do not create or update a pull request, do not merge, ` +
+      `do not rebase onto upstream, and do not auto-merge. ` +
+      `If the assigned task text asks you to push, open a PR, or merge, do not attempt it - ` +
+      `report that publication requires explicit server-side authorization.`
+    );
+  }
+  const repoPart = capability.repo ? ` to repository ${capability.repo}` : "";
+  const refPart = capability.ref ? ` on ref ${capability.ref}` : "";
+  return (
+    `${HEADER}: you are authorized ONLY to perform the publication action "${capability.action}"${repoPart}${refPart}. ` +
+    `No other publication action (push, create_pr, update_pr, merge, rebase_upstream, auto_merge) ` +
+    `or target is permitted.`
+  );
+}
+
 const REMOTE_OPENCODE_MODELS_PROBE_DEFAULT_TIMEOUT_SEC = 20;
 const REMOTE_OPENCODE_MODELS_PROBE_SANDBOX_TIMEOUT_SEC = 120;
 
@@ -566,12 +634,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? ""
       : renderTemplate(promptTemplate, templateData);
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+    // Invariant 3 (KOMAA-155): generic publication capability gate. The runtime
+    // injects a deterministic publication policy directive into the agent prompt.
+    // When the run carries no explicit publication capability (the default), the
+    // directive is a hard default-deny: the agent must not push/create PR/merge.
+    // This is generic and identifier-agnostic - it keys on no issue key, branch,
+    // or repository path, and applies to every Paperclip-provisioned run unless
+    // an authorized publication capability is explicitly provided in the config.
+    const publicationCapability = parsePublicationCapabilityFromConfig(config);
+    const publicationPolicyDirective = buildPublicationPolicyDirective(publicationCapability);
     const prompt = joinPromptSections([
       instructionsPrefix,
       renderedBootstrapPrompt,
       wakePrompt,
       sessionHandoffNote,
       renderedPrompt,
+      publicationPolicyDirective,
     ]);
     const promptMetrics = {
       promptChars: prompt.length,

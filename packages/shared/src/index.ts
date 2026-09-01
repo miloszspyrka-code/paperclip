@@ -1755,6 +1755,7 @@ export {
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
 } from "./execution-workspace-guards.js";
+export * from "./execution-workspace-contract.js";
 
 export {
   MAX_TASK_DRAIN_TTL_MS,

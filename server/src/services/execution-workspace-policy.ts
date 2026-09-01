@@ -5,6 +5,7 @@ import type {
   ProjectExecutionWorkspaceDefaultMode,
   ProjectExecutionWorkspacePolicy,
   SharedWorkspaceConcurrency,
+  WorkspaceContractRequirement,
 } from "@paperclipai/shared";
 import { asString, parseObject } from "../adapters/utils.js";
 
@@ -359,6 +360,23 @@ export function resolveSharedWorkspaceConcurrency(input: {
   return input.issueSettings?.sharedWorkspaceConcurrency
     ?? (input.projectPolicy?.enabled ? input.projectPolicy.sharedWorkspaceConcurrency : undefined)
     ?? "auto";
+}
+
+/**
+ * Invariant 1 (server-side workspace contract gate). Derive the workspace
+ * contract requirement the execution provisioner must satisfy from the
+ * *resolved* execution workspace mode. When the resolved mode is isolated the
+ * contract requires an isolated git worktree; every other mode leaves the
+ * provisioner free (shared / operator / agent_default flows proceed, honoring
+ * invariant F — no global ban on shared workspace). The mapping is purely a
+ * function of the resolved mode: it keys on no issue identifier, project path,
+ * or branch name, so the gate is identifier-agnostic and project-agnostic.
+ */
+export function deriveWorkspaceContractFromResolvedMode(
+  mode: ParsedExecutionWorkspaceMode,
+): WorkspaceContractRequirement | null {
+  if (mode !== "isolated_workspace") return null;
+  return { mode: "isolated_workspace", strategyType: "git_worktree" };
 }
 
 export function buildExecutionWorkspaceAdapterConfig(input: {

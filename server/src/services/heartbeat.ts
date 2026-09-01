@@ -290,6 +290,7 @@ import {
 } from "./run-scratch.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
+  deriveWorkspaceContractFromResolvedMode,
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
@@ -18706,6 +18707,16 @@ export function heartbeatService(
                   enableWorkspaceDirtyQuarantineRepair:
                     resolvedInstanceSettings.experimental
                       .enableWorkspaceDirtyQuarantineRepair,
+                  // Invariant 1 (server-side workspace contract gate): when the
+                  // authoritative resolved execution workspace mode is isolated, the
+                  // realized workspace must be an isolated git worktree. The provisioner
+                  // (realizeExecutionWorkspace) rejects a project_primary / operator
+                  // / wrong-worktree realization before any git topology mutation. The
+                  // contract is derived from the resolved mode, not from any issue key,
+                  // so the gate is identifier-agnostic.
+                  contract: deriveWorkspaceContractFromResolvedMode(
+                    resolvedExecutionWorkspaceMode as unknown as Parameters<typeof deriveWorkspaceContractFromResolvedMode>[0],
+                  ),
                   recorder: workspaceOperationRecorder,
                   resolveGitAuth: workspaceGitAuthProvider,
                 })
@@ -18738,6 +18749,9 @@ export function heartbeatService(
               enableWorkspaceDirtyQuarantineRepair:
                 resolvedInstanceSettings.experimental
                   .enableWorkspaceDirtyQuarantineRepair,
+              contract: deriveWorkspaceContractFromResolvedMode(
+                resolvedExecutionWorkspaceMode as unknown as Parameters<typeof deriveWorkspaceContractFromResolvedMode>[0],
+              ),
               recorder: workspaceOperationRecorder,
               resolveGitAuth: workspaceGitAuthProvider,
             }),

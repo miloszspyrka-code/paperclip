@@ -31,6 +31,11 @@ import {
   type WorkspaceOperationPhase,
   type WorkspaceRuntimeDesiredState,
   type WorkspaceRuntimeServiceStateMap,
+  validateBranchTemplate,
+  validateExecutionWorkspaceContract,
+  BRANCH_TEMPLATE_MALFORMED_CODE,
+  WORKSPACE_CONTRACT_MISMATCH_CODE,
+  type WorkspaceContractRequirement,
 } from "@paperclipai/shared";
 import { and, desc, eq, gte, inArray, isNull, lte, ne, or } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
@@ -3210,10 +3215,45 @@ export async function realizeExecutionWorkspace(input: {
   enableWorkspaceDirtyQuarantineRepair?: boolean;
   recorder?: WorkspaceOperationRecorder | null;
   resolveGitAuth?: GitRemoteAuthProvider | null;
+  /**
+   * Invariant 1 (KOMAA-155): when the authoritative task/agent/project
+   * execution contract requires isolated execution, the realized workspace
+   * must be an isolated git worktree. If the resolved strategy would realize a
+   * project_primary / operator-checkout workspace instead, fail closed before
+   * any worktree/branch mutation. Absent here (legacy callers) preserves prior
+   * behavior; the run-dispatch path passes the derived contract.
+   */
+  contract?: WorkspaceContractRequirement | null;
 }): Promise<RealizedExecutionWorkspace> {
   const rawStrategy = parseObject(input.config.workspaceStrategy);
   const strategyType = asString(rawStrategy.type, "project_primary");
   const requestedExistingBranch = asString(rawStrategy.existingBranch, "").trim();
+
+  // Invariant 1: server-side workspace contract gate before any mutating work.
+  // Never fall back isolated -> shared/project_primary; reject the realization.
+  if (input.contract) {
+    const contractDecision = validateExecutionWorkspaceContract({
+      requirement: input.contract,
+      realized: {
+        mode: strategyType === "git_worktree" ? "isolated_workspace" : "shared_workspace",
+        source: strategyType,
+        isOperatorCheckout: strategyType !== "git_worktree",
+      },
+    });
+    if (!contractDecision.ok) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Execution workspace contract violation (${contractDecision.code}): ${contractDecision.reason}. ` +
+          `Paperclip's workspace provisioner must create the isolated git worktree; the agent runtime may not self-heal workspace topology.`,
+        {
+          workspaceValidation: {
+            code: contractDecision.code,
+            reason: contractDecision.reason,
+            detail: contractDecision.detail,
+          },
+        },
+      );
+    }
+  }
   if (strategyType !== "git_worktree") {
     if (requestedExistingBranch) {
       throw new WorkspaceRuntimeValidationFailure(
@@ -3266,6 +3306,25 @@ export async function realizeExecutionWorkspace(input: {
     branchName = requestedExistingBranch;
   } else {
     const branchTemplate = asString(rawStrategy.branchTemplate, "{{issue.identifier}}-{{slug}}");
+    // Invariant 4: malformed literal `{issueKey}` / unresolved single-brace
+    // placeholders must fail preflight and must never silently create a branch
+    // literally named after the placeholder. Only the supported double-brace
+    // token `{{issue.identifier}}` (plus the legacy `{slug}`) is valid.
+    const templateCheck = validateBranchTemplate(branchTemplate);
+    if (!templateCheck.ok) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Workspace branch template is malformed (${templateCheck.code}): ${templateCheck.reason}. ` +
+          `Use the supported double-brace token "{{issue.identifier}}".`,
+        {
+          workspaceValidation: {
+            code: templateCheck.code,
+            reason: templateCheck.reason,
+            offendingPlaceholder: templateCheck.offendingPlaceholder ?? null,
+            branchTemplate,
+          },
+        },
+      );
+    }
     const renderedBranch = renderWorkspaceTemplate(branchTemplate, {
       issue: input.issue,
       agent: input.agent,
